@@ -89,8 +89,14 @@ describe.skipIf(!TOOLS_AVAILABLE)("scenario runner", () => {
     const example = join(import.meta.dir, "..", "..", "examples", "menu-smoke.yaml");
     const report = await runScenario(example, { outDir: join(workDir, "out-example") });
 
+    /* Assert on the failing steps rather than on `ok` alone. This test runs a real curses app on
+       whatever machine CI happens to give us, so it is the one most likely to fail somewhere the
+       author cannot reach — and `expected true, got false` says nothing about which step broke. */
+    const failures = report.steps
+      .filter((step) => !step.ok)
+      .map((step) => `step ${step.index} (${step.action}): ${step.detail}`);
+    expect(failures).toEqual([]);
     expect(report.ok).toBe(true);
-    expect(report.steps.every((step) => step.ok)).toBe(true);
     /* The golden must MATCH, not be created: a missing golden would silently pass otherwise. */
     expect(report.steps.find((step) => step.action === "golden")?.detail).toContain("matches");
   }, 90_000);
