@@ -1,0 +1,55 @@
+name: Bug report
+description: Something behaves differently from what the docs promise
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Most reports come down to what was on the screen at the moment things went wrong, so please
+        include the capture rather than describing it.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: The exact commands
+      description: >
+        The full sequence, starting from `tui start`. If the TUI you are driving is not public, a
+        small fixture that shows the same problem helps enormously.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: screen
+    attributes:
+      label: The screen and its header
+      description: >
+        Output of `tui snap <session>` — the header line matters, it carries the size, cursor,
+        mouse mode and exit status.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `tui doctor`
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `tui --version`, or the commit you are on.
+    validations:
+      required: true

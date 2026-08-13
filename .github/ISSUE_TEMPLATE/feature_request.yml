@@ -1,0 +1,31 @@
+name: Feature request
+description: Suggest a capability the tool is missing
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do
+      description: The task you are stuck on, not the solution you have in mind.
+    validations:
+      required: true
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: What you do today
+      description: How you work around it now, and where that breaks down.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: audience
+    attributes:
+      label: Who is this for
+      options:
+        - An AI agent driving a TUI
+        - A person at a terminal
+        - A test suite in CI
+        - Something else
+    validations:
+      required: true

@@ -1,0 +1,13 @@
+# Generated or vendored.
+node_modules/
+coverage/
+.tui-artifacts/
+bun.lock
+
+# A symlink to skills/tui-driver/SKILL.md. Formatting it would write through the link and process
+# the same file twice; the real path is covered.
+AGENTS.md
+
+# Golden screens are byte-exact captures of a terminal. Reflowing one would rewrite the very thing
+# it exists to compare against.
+examples/golden/

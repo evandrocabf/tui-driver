@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.11"
+
+      # tmux is the whole point of this tool, and ncurses-term carries the
+      # tmux-256color entry that the private tmux config selects.
+      - name: Install tmux (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux ncurses-term
+
+      - name: Install tmux (macOS)
+        if: runner.os == 'macOS'
+        run: brew install tmux
+
+      # The integration tests skip themselves when these are missing, which would
+      # turn a broken runner into a green build. Fail loudly instead.
+      - name: Verify the harness dependencies are present
+        run: |
+          tmux -V
+          python3 --version
+
+      # install.sh is the first thing a user runs, so a shell syntax error there is worse than
+      # anything the TypeScript linter could find. shellcheck is preinstalled on GitHub runners.
+      - name: Check the shell scripts
+        if: runner.os == 'Linux'
+        run: |
+          bash -n install.sh
+          bash -n tests/fixtures/mouse-echo.sh
+          shellcheck --severity=warning install.sh tests/fixtures/mouse-echo.sh
+
+      - run: bun install --frozen-lockfile
+
+      - run: bun run typecheck
+
+      - run: bun run lint
+
+      - run: bun run format:check
+
+      # Also the backstop for silently skipped integration tests: if they do not
+      # run, coverage drops far below the floor and this step fails.
+      - run: bun run test:coverage

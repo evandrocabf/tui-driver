@@ -1,0 +1,25 @@
+name: menu-smoke
+cwd: ".."
+command: ["python3", "tests/fixtures/menu.py"]
+size: 64x14
+settle: 500ms
+
+steps:
+  - wait: { text: "TUI DRIVER DEMO", timeout: 10s }
+  - expect: { text: "SELECTED: Dashboard" }
+  - snap: 01-boot
+
+  - keys: [Down, Down]
+  - wait: { stable: 250ms }
+  - expect: { text: "SELECTED: Profile" }
+
+  - click: { text: "Reports" }
+  - wait: { stable: 250ms }
+  - expect: { text: "ACTIVATED: Reports" }
+  - expect: { notText: "Traceback" }
+  - snap: { label: 02-reports, png: true }
+
+  - golden: menu-reports
+
+  - keys: [q]
+  - wait: { exit: true, timeout: 5s }

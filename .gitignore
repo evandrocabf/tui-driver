@@ -1,0 +1,14 @@
+node_modules/
+dist/
+coverage/
+*.log
+.tui-artifacts/
+
+# Captures belong to whatever project was being driven, not to this one. `tui render`
+# and `tui snap --png` keep them in the session store by default, but an explicit
+# `--out` can still aim anywhere, and this repo is a convenient cwd.
+screenshots/
+*.png
+*.svg
+!docs/*.png
+!docs/*.svg

@@ -1,0 +1,14 @@
+  TUI DRIVER DEMO
+  arrows or click to select, enter to activate, q to quit
+
+      Dashboard
+      Settings
+      Profile
+    > Reports
+      Quit
+
+  SELECTED: Reports
+  ACTIVATED: Reports
+  EVENT: mouse 9,6 state=0x1
+
+
