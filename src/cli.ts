@@ -1239,7 +1239,7 @@ const COMMANDS: Record<string, Command> = {
         detail:
           backends.length > 0
             ? backends.join(", ")
-            : "no rasterizer (install librsvg2-tools or ImageMagick); --svg still works",
+            : "no rasterizer (install rsvg-convert or ImageMagick); --svg still works",
       });
 
       checks.push({ name: "state directory", ok: true, required: false, detail: rootDir() });

@@ -28,15 +28,20 @@ jobs:
 
       # tmux is the whole point of this tool, and ncurses-term carries the
       # tmux-256color entry that the private tmux config selects.
-      - name: Install tmux (Linux)
+      # rsvg-convert is installed deliberately rather than left to whatever the
+      # image happens to ship: the example scenario renders a PNG, and a runner
+      # with no rasterizer at all fails it. Installing it also means the
+      # rsvg-convert backend is exercised on both platforms instead of only
+      # wherever ImageMagick happens to be preinstalled.
+      - name: Install tmux and a rasterizer (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y tmux ncurses-term
+          sudo apt-get install -y tmux ncurses-term librsvg2-bin
 
-      - name: Install tmux (macOS)
+      - name: Install tmux and a rasterizer (macOS)
         if: runner.os == 'macOS'
-        run: brew install tmux
+        run: brew install tmux librsvg
 
       # The integration tests skip themselves when these are missing, which would
       # turn a broken runner into a green build. Fail loudly instead.
@@ -44,6 +49,7 @@ jobs:
         run: |
           tmux -V
           python3 --version
+          rsvg-convert --version
 
       # install.sh is the first thing a user runs, so a shell syntax error there is worse than
       # anything the TypeScript linter could find. shellcheck is preinstalled on GitHub runners.

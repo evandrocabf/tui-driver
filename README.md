@@ -27,7 +27,8 @@ video on the selected row, and the mouse event the app received are all real.
   `resize-window` needs 2.9. Verified on 3.5a and 3.6a.
 - **`bun` ≥ 1.3.11.**
 - **Linux or macOS.** Windows is not supported natively — the tool is a tmux driver. WSL is fine.
-- Optional, for PNG output: `rsvg-convert` (librsvg2-tools) **or** ImageMagick **or** Chrome.
+- Optional, for PNG output: `rsvg-convert` (`librsvg2-bin` on Debian/Ubuntu, `librsvg2-tools` on
+  Fedora, `brew install librsvg` on macOS) **or** ImageMagick **or** Chrome.
   Without any of them, `--svg` still works with zero dependencies, and `tui doctor` reports it as a
   warning rather than a failure.
 

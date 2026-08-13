@@ -41,4 +41,4 @@ temp directory with a hashed name when that path would exceed the ~108-byte unix
 When neither `rsvg-convert` nor ImageMagick is installed, PNG rendering falls back to headless Chrome
 and passes `--no-sandbox`, because the input is an SVG this tool generated itself and the sandbox
 often cannot start in containers. If that trade-off is not acceptable in your environment, install
-`librsvg2-tools` or ImageMagick, or use `--svg`, which needs no external tool at all.
+`rsvg-convert` or ImageMagick, or use `--svg`, which needs no external tool at all.
