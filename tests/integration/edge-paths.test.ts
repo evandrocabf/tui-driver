@@ -233,6 +233,13 @@ describe.skipIf(!TOOLS_AVAILABLE)("edge paths", () => {
         }
         expect(caught).toBeInstanceOf(DependencyError);
         expect((caught as Error).message).toContain("no SVG rasterizer found");
+        /* The advice has to name a flag the CLI actually accepts. It read "--format svg" for a
+           while, which exits 2 as an unknown option — wrong at the one moment the reader has no
+           rasterizer and needs the escape hatch to work. Checked against `help render` rather than
+           a hard-coded name, so renaming the flag cannot leave the advice behind. */
+        const advised = /--[a-z-]+/.exec((caught as Error).message)?.[0] ?? "";
+        expect(advised).not.toBe("");
+        expect((await run(["help", "render"])).stdout).toContain(advised);
 
         /* Chrome specifically: forced, with none of its four names resolvable. */
         let chromeError: unknown;

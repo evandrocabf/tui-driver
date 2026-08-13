@@ -140,7 +140,7 @@ export async function svgToPng(
 
   if (available.length === 0) {
     throw new DependencyError(
-      "no SVG rasterizer found — install rsvg-convert (librsvg2-bin, librsvg2-tools, or brew librsvg) or ImageMagick, or use --format svg",
+      "no SVG rasterizer found — install rsvg-convert (librsvg2-bin, librsvg2-tools, or brew librsvg) or ImageMagick, or use --svg",
     );
   }
 
