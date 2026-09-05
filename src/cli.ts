@@ -6,20 +6,23 @@
  * no state to thread between calls — the session in tmux is the state.
  */
 
-import { rm } from "node:fs/promises";
+import { readdir, rm } from "node:fs/promises";
 import { join, resolve as resolvePath } from "node:path";
 
 import packageJson from "../package.json" with { type: "json" };
 
 import { Args, formatOptions, parseArgs, type OptionSpecs } from "./args.js";
+import { sessionCapabilities } from "./capabilities.js";
 import { capture, type Snapshot } from "./capture.js";
 import { diffText, formatDiff } from "./diff.js";
+import { requireSupportedTmux, runTmuxCanary } from "./doctor.js";
 import { CliError, ConditionError, UsageError } from "./errors.js";
 import { renderSnapshot, snapshotToJson, table, withRuler } from "./format.js";
 import {
   assertLabel,
   listFrames,
   readFrameAnsi,
+  readFrameState,
   readFrameText,
   resolveFrame,
   saveFrame,
@@ -29,10 +32,14 @@ import {
   mouseDrag,
   mouseMove,
   mouseScroll,
+  parseMouseEncoding,
   pasteText,
-  queryMouseModes,
+  sendFocus,
+  sendKittyKeyEvent,
   sendKeys,
+  sendRawBytes,
   sendText,
+  type MouseSendOptions,
 } from "./input.js";
 import { DEFAULT_TTL_MS, NEVER, reap, resolveTtlMs, sweep } from "./lifetime.js";
 import { locate, pickMatch, type LocateOptions, type ScreenMatch } from "./locate.js";
@@ -42,9 +49,9 @@ import {
   NO_MODIFIERS,
   parseButton,
   parseModifiers,
-  type MouseEncoding,
+  pickEncoding,
 } from "./mouse.js";
-import { framesDir, rootDir, sessionDir, socketPath } from "./paths.js";
+import { framesDir, rootDir, sessionDir, sessionsRoot, socketPath } from "./paths.js";
 import { detectBackends } from "./png.js";
 import { renderAnsiToFile, type RenderFormat } from "./render.js";
 import { runScenario, formatScenarioReport } from "./scenario.js";
@@ -58,7 +65,7 @@ import {
   startSession,
   stopSession,
 } from "./session.js";
-import { listSessionNames, tmuxVersion } from "./tmux.js";
+import { listSessionNames } from "./tmux.js";
 import { formatElapsed, parseDuration, parseSize, sleep, stampFor } from "./util.js";
 import { runWatchLoop, readWatcher, startWatcher, stopWatcher } from "./watch.js";
 import { waitFor, waitUntilDrawn } from "./wait.js";
@@ -99,6 +106,14 @@ const ACTION_OPTIONS: OptionSpecs = {
   snap: { type: "boolean", describe: "capture and print the screen after the action" },
   settle: { type: "string", describe: "wait for the screen to settle before capturing" },
   json: { type: "boolean", describe: "emit machine-readable JSON" },
+};
+
+const MOUSE_SAFETY_OPTIONS: OptionSpecs = {
+  force: {
+    type: "boolean",
+    describe: "send even if mouse reporting is off or legacy coordinates are unreachable",
+  },
+  "if-hash": { type: "string", describe: "send only while the screen state has this hash" },
 };
 
 /** Which image format was asked for, if any. `--svg` wins over `--png` when both are given. */
@@ -160,11 +175,14 @@ async function afterAction(name: string, args: Args, summary: string): Promise<n
 
   const settle = parseDuration(args.string("settle"), 300);
   if (settle > 0) {
-    await waitFor(name, {
+    const result = await waitFor(name, {
       stableMs: settle,
       timeoutMs: Math.max(settle * 8, 3000),
       intervalMs: 60,
     });
+    if (!result.ok) {
+      throw new ConditionError(`screen did not settle: ${result.pending.join("; ")}`);
+    }
   }
   const snapshot = await capture(name);
   if (args.boolean("json")) {
@@ -240,7 +258,7 @@ async function resolveClickTarget(
   name: string,
   args: Args,
   startIndex: number,
-): Promise<{ x: number; y: number; match?: ScreenMatch }> {
+): Promise<{ x: number; y: number; match?: ScreenMatch; stateHash?: string }> {
   const pattern = args.string("text");
   if (pattern !== undefined) {
     const snapshot = await capture(name);
@@ -256,7 +274,7 @@ async function resolveClickTarget(
         : anchor === "end"
           ? match.col + Math.max(0, match.width - 1)
           : match.centerCol;
-    return { x, y: match.row, match };
+    return { x, y: match.row, match, stateHash: snapshot.stateHash };
   }
 
   const rawX = args.positional(startIndex);
@@ -272,45 +290,105 @@ async function resolveClickTarget(
   return { x, y };
 }
 
-/**
- * Warn when a mouse event will not land, rather than letting it fail silently.
- *
- * Two ways that happens: the application never enabled mouse reporting, or the coordinates fall
- * outside what the legacy x10 encoding can express. Both are warnings, not errors — the bytes were
- * delivered, and the caller may still have wanted that.
- */
-async function warnIfMouseOff(
+/** Validate coordinates and screen identity before any mouse bytes reach the pane. */
+async function checkedMouseOptions(
   name: string,
-  encoding: MouseEncoding,
+  args: Args,
   cells: readonly { x: number; y: number }[],
-): Promise<void> {
-  const modes = await queryMouseModes(name);
-  if (!modes.any) {
-    warn(
-      `warning: this TUI has not enabled mouse reporting (mouse ${describeModes(modes)}) — the event was delivered but will likely be ignored`,
+  capturedHash?: string,
+): Promise<MouseSendOptions> {
+  const snapshot = await capture(name);
+  const expected = args.string("if-hash") ?? capturedHash;
+  if (expected !== undefined && expected !== snapshot.stateHash) {
+    throw new ConditionError(
+      `screen changed before the mouse action (expected ${expected}, now ${snapshot.stateHash})`,
     );
-    return;
   }
+  for (const cell of cells) {
+    if (
+      !Number.isInteger(cell.x) ||
+      !Number.isInteger(cell.y) ||
+      cell.x < 0 ||
+      cell.y < 0 ||
+      cell.x >= snapshot.cols ||
+      cell.y >= snapshot.rows
+    ) {
+      throw new UsageError(
+        `mouse coordinate ${cell.x},${cell.y} is outside the ${snapshot.cols}x${snapshot.rows} screen`,
+      );
+    }
+  }
+  const encoding = parseMouseEncoding(args.string("encoding")) ?? pickEncoding(snapshot.mouse);
   const unreachable = cells.some((cell) =>
     legacyOutOfRange(
       { x: cell.x, y: cell.y, button: "left", action: "press", modifiers: NO_MODIFIERS },
       encoding,
     ),
   );
-  if (unreachable) {
-    warn(
-      `warning: the TUI uses the legacy x10 mouse encoding, which cannot address column or row 95 and beyond — this event was clamped`,
+  if (unreachable && !args.boolean("force")) {
+    throw new ConditionError(
+      "legacy x10 cannot address column or row 95 and beyond; use a smaller screen or --force",
     );
   }
+  return {
+    encoding,
+    modes: snapshot.mouse,
+    ...(args.boolean("force") ? { force: true } : {}),
+  };
 }
 
-export /**
+function parseHexBytes(input: string): number[] {
+  const compact = input
+    .trim()
+    .replace(/^0x/i, "")
+    .replace(/[\s,:_-]+/g, "");
+  if (compact === "" || compact.length % 2 !== 0 || !/^[0-9a-f]+$/i.test(compact)) {
+    throw new UsageError("--hex expects complete byte pairs, e.g. '1b 5b 49'");
+  }
+  return compact.match(/../g)?.map((part) => Number.parseInt(part, 16)) ?? [];
+}
+
+function parseKeyCodePoint(input: string): number {
+  if (/^U\+[0-9a-f]+$/i.test(input)) return Number.parseInt(input.slice(2), 16);
+  if (/^\d+$/.test(input)) return Number.parseInt(input, 10);
+  const characters = [...input];
+  if (characters.length !== 1) {
+    throw new UsageError("key-event expects one character, a decimal code point, or U+NNNN");
+  }
+  return characters[0]?.codePointAt(0) ?? 0;
+}
+
+function parseCursor(input: string | undefined): { x: number; y: number } | undefined {
+  if (input === undefined) return undefined;
+  const match = /^(\d+)\s*,\s*(\d+)$/.exec(input);
+  if (!match) throw new UsageError("--cursor expects X,Y");
+  return { x: Number(match[1]), y: Number(match[2]) };
+}
+
+function comparableState(snapshot: Snapshot): string {
+  return JSON.stringify(
+    {
+      cols: snapshot.cols,
+      rows: snapshot.rows,
+      cursor: snapshot.cursor,
+      dead: snapshot.dead,
+      exitStatus: snapshot.exitStatus,
+      alternateScreen: snapshot.alternateScreen,
+      mouse: snapshot.mouse,
+      grid: snapshot.grid,
+    },
+    null,
+    2,
+  );
+}
+
+/**
  * Every command, keyed by the name typed on the command line.
  *
  * Insertion order is the order `tui help` lists them, so they are grouped by how they are used —
  * start and inspect, act, wait and record, then housekeeping.
  */
-const COMMANDS: Record<string, Command> = {
+export const COMMANDS: Record<string, Command> = {
   start: {
     summary: "Launch a TUI in a detached tmux session",
     usage: "tui start [options] -- <command> [args...]",
@@ -361,6 +439,7 @@ const COMMANDS: Record<string, Command> = {
 
       const settle = parseDuration(args.string("settle"), 400);
       const waitText = args.string("wait-text");
+      let ready = true;
       if (waitText !== undefined) {
         const result = await waitFor(meta.name, {
           text: waitText,
@@ -368,7 +447,8 @@ const COMMANDS: Record<string, Command> = {
           intervalMs: 100,
         });
         if (!result.ok) {
-          warn(`warning: --wait-text never matched: ${result.pending.join("; ")}`);
+          ready = false;
+          warn(`condition not met: --wait-text never matched: ${result.pending.join("; ")}`);
         }
       } else {
         await waitUntilDrawn(meta.name, Math.max(3000, settle * 4));
@@ -380,7 +460,7 @@ const COMMANDS: Record<string, Command> = {
         output(
           JSON.stringify({ session: meta, attach: attachCommand(meta.name), snapshot }, null, 2),
         );
-        return 0;
+        return ready ? 0 : 1;
       }
 
       output(
@@ -388,7 +468,7 @@ const COMMANDS: Record<string, Command> = {
       );
       output(`attach with: ${attachCommand(meta.name)}`);
       if (args.boolean("snap", true)) output(renderSnapshot(snapshot));
-      return 0;
+      return ready ? 0 : 1;
     },
   },
 
@@ -422,6 +502,37 @@ const COMMANDS: Record<string, Command> = {
         ]);
       }
       output(table(rows));
+      return 0;
+    },
+  },
+
+  capabilities: {
+    summary: "Report the active pane's negotiated input and capture capabilities",
+    usage: "tui capabilities <session> [--json]",
+    options: { json: { type: "boolean", describe: "emit machine-readable JSON" } },
+    async run(args) {
+      const name = args.requirePositional(0, "session name");
+      await requireSession(name);
+      const capabilities = await sessionCapabilities(name);
+      if (args.boolean("json")) {
+        output(JSON.stringify(capabilities, null, 2));
+        return 0;
+      }
+      output(
+        table([
+          ["CAPABILITY", "VALUE"],
+          ["scope", capabilities.scope],
+          ["tmux", capabilities.tmux.version],
+          [
+            "extended keys",
+            `${capabilities.tmux.extendedKeys} (${capabilities.tmux.extendedKeysFormat})`,
+          ],
+          ["focus events", String(capabilities.tmux.focusEvents)],
+          ["mouse", describeModes(capabilities.mouse)],
+          ["styled cells", "yes"],
+          ["terminal graphics", "no"],
+        ]),
+      );
       return 0;
     },
   },
@@ -536,6 +647,86 @@ const COMMANDS: Record<string, Command> = {
     },
   },
 
+  bytes: {
+    summary: "Inject exact bytes into the pane",
+    usage: "tui bytes <session> --hex '1b 5b 49' | --base64 <data> | --file <path>",
+    options: {
+      ...ACTION_OPTIONS,
+      hex: { type: "string", describe: "bytes as hexadecimal pairs" },
+      base64: { type: "string", describe: "bytes encoded as base64" },
+      file: { type: "string", describe: "read exact bytes from a file" },
+    },
+    async run(args) {
+      const name = args.requirePositional(0, "session name");
+      await requireSession(name);
+      const sources = [args.has("hex"), args.has("base64"), args.has("file")].filter(
+        Boolean,
+      ).length;
+      if (sources !== 1) throw new UsageError("choose exactly one of --hex, --base64 or --file");
+      let bytes: number[];
+      if (args.string("hex") !== undefined) bytes = parseHexBytes(args.string("hex") ?? "");
+      else if (args.string("base64") !== undefined) {
+        const raw = args.string("base64") ?? "";
+        if (raw === "" || !/^[A-Za-z0-9+/]*={0,2}$/.test(raw) || raw.length % 4 !== 0) {
+          throw new UsageError("--base64 is not valid base64");
+        }
+        bytes = [...Buffer.from(raw, "base64")];
+      } else {
+        bytes = [
+          ...new Uint8Array(await Bun.file(resolvePath(args.string("file") ?? "")).arrayBuffer()),
+        ];
+      }
+      await sendRawBytes(name, [bytes]);
+      return afterAction(name, args, `sent ${bytes.length} raw bytes`);
+    },
+  },
+
+  focus: {
+    summary: "Send a terminal focus-in or focus-out event",
+    usage: "tui focus <session> --in|--out",
+    options: {
+      ...ACTION_OPTIONS,
+      in: { type: "boolean", describe: "send focus-in (CSI I)" },
+      out: { type: "boolean", describe: "send focus-out (CSI O)" },
+    },
+    async run(args) {
+      const name = args.requirePositional(0, "session name");
+      await requireSession(name);
+      if (args.boolean("in") === args.boolean("out")) {
+        throw new UsageError("choose exactly one of --in or --out");
+      }
+      const focused = args.boolean("in");
+      await sendFocus(name, focused);
+      return afterAction(name, args, `sent focus-${focused ? "in" : "out"}`);
+    },
+  },
+
+  "key-event": {
+    summary: "Send a Kitty CSI-u key press, repeat or release event",
+    usage: "tui key-event <session> <character|codepoint> [--event press|repeat|release]",
+    options: {
+      ...ACTION_OPTIONS,
+      event: { type: "string", describe: "press (default), repeat or release" },
+      modifiers: { type: "string", describe: "comma-separated Kitty modifiers" },
+    },
+    async run(args) {
+      const name = args.requirePositional(0, "session name");
+      await requireSession(name);
+      const codePoint = parseKeyCodePoint(args.requirePositional(1, "character or code point"));
+      const event = args.string("event") ?? "press";
+      if (event !== "press" && event !== "repeat" && event !== "release") {
+        throw new UsageError(`unknown key event: ${event}`);
+      }
+      const modifiers = (args.string("modifiers") ?? "").split(/[,+\s]+/).filter(Boolean);
+      await sendKittyKeyEvent(name, codePoint, modifiers, event);
+      return afterAction(
+        name,
+        args,
+        `sent Kitty ${event} for U+${codePoint.toString(16).toUpperCase()}`,
+      );
+    },
+  },
+
   click: {
     summary: "Send a mouse click at a cell, or at matching on-screen text",
     usage: "tui click <session> <x> <y> | tui click <session> --text <pattern>",
@@ -551,6 +742,7 @@ const COMMANDS: Record<string, Command> = {
       modifiers: { type: "string", describe: "ctrl, alt, shift (comma separated)" },
       encoding: { type: "string", describe: "force sgr, utf8 or x10 encoding" },
       delay: { type: "string", describe: "delay between repeated clicks" },
+      ...MOUSE_SAFETY_OPTIONS,
     },
     async run(args) {
       const name = args.requirePositional(0, "session name");
@@ -558,13 +750,18 @@ const COMMANDS: Record<string, Command> = {
       const target = await resolveClickTarget(name, args, 1);
       const button = parseButton(args.string("button"));
       const modifiers = parseModifiers(args.string("modifiers"));
+      const safe = await checkedMouseOptions(
+        name,
+        args,
+        [{ x: target.x, y: target.y }],
+        target.stateHash,
+      );
 
       const encoding = await mouseClick(name, target.x, target.y, button, modifiers, {
-        ...(args.string("encoding") ? { encoding: args.string("encoding") as MouseEncoding } : {}),
+        ...safe,
         ...(args.number("count") !== undefined ? { count: args.number("count") } : {}),
         delayMs: parseDuration(args.string("delay"), 60),
       });
-      await warnIfMouseOff(name, encoding, [{ x: target.x, y: target.y }]);
 
       const where = target.match
         ? `${target.x},${target.y} (${JSON.stringify(target.match.text)})`
@@ -586,17 +783,24 @@ const COMMANDS: Record<string, Command> = {
       button: { type: "string", describe: "report this button as held during the motion" },
       modifiers: { type: "string", describe: "ctrl, alt, shift (comma separated)" },
       encoding: { type: "string", describe: "force sgr, utf8 or x10 encoding" },
+      ...MOUSE_SAFETY_OPTIONS,
     },
     async run(args) {
       const name = args.requirePositional(0, "session name");
       await requireSession(name);
       const target = await resolveClickTarget(name, args, 1);
       const modifiers = parseModifiers(args.string("modifiers"));
+      const safe = await checkedMouseOptions(
+        name,
+        args,
+        [{ x: target.x, y: target.y }],
+        target.stateHash,
+      );
       const encoding = await mouseMove(name, target.x, target.y, modifiers, {
-        ...(args.string("encoding") ? { encoding: args.string("encoding") as MouseEncoding } : {}),
+        ...safe,
         ...(args.string("button") ? { button: parseButton(args.string("button")) } : {}),
       });
-      const modes = await queryMouseModes(name);
+      const modes = safe.modes!;
       if (!modes.all && !modes.button) {
         warn(
           `warning: this TUI tracks mouse as ${describeModes(modes)} — plain motion events are only reported under button-event(1002) or any-event(1003)`,
@@ -616,6 +820,7 @@ const COMMANDS: Record<string, Command> = {
       delay: { type: "string", describe: "delay between motion events (default 20ms)" },
       modifiers: { type: "string", describe: "ctrl, alt, shift (comma separated)" },
       encoding: { type: "string", describe: "force sgr, utf8 or x10 encoding" },
+      ...MOUSE_SAFETY_OPTIONS,
     },
     async run(args) {
       const name = args.requirePositional(0, "session name");
@@ -625,6 +830,10 @@ const COMMANDS: Record<string, Command> = {
         throw new UsageError("drag needs four coordinates: <x1> <y1> <x2> <y2>");
       }
       const [x1, y1, x2, y2] = coordinates as [number, number, number, number];
+      const safe = await checkedMouseOptions(name, args, [
+        { x: x1, y: y1 },
+        { x: x2, y: y2 },
+      ]);
       const encoding = await mouseDrag(
         name,
         { x: x1, y: y1 },
@@ -632,17 +841,11 @@ const COMMANDS: Record<string, Command> = {
         parseButton(args.string("button")),
         parseModifiers(args.string("modifiers")),
         {
-          ...(args.string("encoding")
-            ? { encoding: args.string("encoding") as MouseEncoding }
-            : {}),
+          ...safe,
           ...(args.number("steps") !== undefined ? { steps: args.number("steps") } : {}),
           delayMs: parseDuration(args.string("delay"), 20),
         },
       );
-      await warnIfMouseOff(name, encoding, [
-        { x: x1, y: y1 },
-        { x: x2, y: y2 },
-      ]);
       return afterAction(name, args, `dragged ${x1},${y1} -> ${x2},${y2} using ${encoding}`);
     },
   },
@@ -659,6 +862,7 @@ const COMMANDS: Record<string, Command> = {
       amount: { type: "number", describe: "number of wheel notches (default 3)" },
       modifiers: { type: "string", describe: "ctrl, alt, shift (comma separated)" },
       encoding: { type: "string", describe: "force sgr, utf8 or x10 encoding" },
+      ...MOUSE_SAFETY_OPTIONS,
     },
     async run(args) {
       const name = args.requirePositional(0, "session name");
@@ -677,6 +881,7 @@ const COMMANDS: Record<string, Command> = {
         rawX === undefined ? Math.floor((snapshot?.cols ?? 80) / 2) : Number.parseInt(rawX, 10);
       const y =
         rawY === undefined ? Math.floor((snapshot?.rows ?? 24) / 2) : Number.parseInt(rawY, 10);
+      const safe = await checkedMouseOptions(name, args, [{ x, y }]);
 
       const encoding = await mouseScroll(
         name,
@@ -685,9 +890,8 @@ const COMMANDS: Record<string, Command> = {
         direction,
         args.number("amount") ?? 3,
         parseModifiers(args.string("modifiers")),
-        args.string("encoding") ? { encoding: args.string("encoding") as MouseEncoding } : {},
+        safe,
       );
-      await warnIfMouseOff(name, encoding, [{ x, y }]);
       return afterAction(name, args, `scrolled ${direction} at ${x},${y} using ${encoding}`);
     },
   },
@@ -746,6 +950,10 @@ const COMMANDS: Record<string, Command> = {
       regex: { type: "boolean", describe: "treat patterns as regular expressions" },
       "ignore-case": { type: "boolean", describe: "case-insensitive matching" },
       stable: { type: "string", describe: "wait until the screen stops changing for this long" },
+      "changed-from": { type: "string", describe: "wait until stateHash differs from this value" },
+      cursor: { type: "string", describe: "wait for cursor position X,Y" },
+      "cursor-visible": { type: "boolean", describe: "wait for cursor visibility" },
+      alternate: { type: "boolean", describe: "wait for alternate-screen state" },
       exit: { type: "boolean", describe: "wait until the process exits" },
       timeout: { type: "string", describe: "give up after this long (default 15s)" },
       interval: { type: "string", describe: "poll interval (default 100ms)" },
@@ -756,12 +964,33 @@ const COMMANDS: Record<string, Command> = {
       const name = args.requirePositional(0, "session name");
       await requireSession(name);
       const hasCondition =
-        args.has("text") || args.has("gone") || args.has("stable") || args.boolean("exit");
+        args.has("text") ||
+        args.has("gone") ||
+        args.has("stable") ||
+        args.has("changed-from") ||
+        args.has("cursor") ||
+        args.has("cursor-visible") ||
+        args.has("alternate") ||
+        args.boolean("exit");
+
+      const cursor = parseCursor(args.string("cursor"));
 
       const result = await waitFor(name, {
         ...(args.string("text") !== undefined ? { text: args.string("text") } : {}),
         ...(args.string("gone") !== undefined ? { gone: args.string("gone") } : {}),
         ...(args.boolean("exit") ? { exit: true } : {}),
+        ...(args.string("changed-from") !== undefined
+          ? { changedFrom: args.string("changed-from") }
+          : {}),
+        ...(cursor || args.has("cursor-visible")
+          ? {
+              cursor: {
+                ...(cursor ?? {}),
+                ...(args.has("cursor-visible") ? { visible: args.boolean("cursor-visible") } : {}),
+              },
+            }
+          : {}),
+        ...(args.has("alternate") ? { alternateScreen: args.boolean("alternate") } : {}),
         ...(args.has("stable") || !hasCondition
           ? { stableMs: parseDuration(args.string("stable"), 400) }
           : {}),
@@ -799,7 +1028,7 @@ const COMMANDS: Record<string, Command> = {
   },
 
   watch: {
-    summary: "Record the screen in the background, saving a frame on every change",
+    summary: "Sample pane state in the background and save observed changes",
     usage: "tui watch <session> [--interval 500ms] [--stop]",
     options: {
       ...IMAGE_OPTIONS,
@@ -882,21 +1111,26 @@ const COMMANDS: Record<string, Command> = {
       theme: { type: "string", describe: "image palette" },
       scale: { type: "number", describe: "image scale" },
       "stop-on-exit": { type: "boolean", describe: "stop when the process exits" },
+      token: { type: "string", describe: "watcher ownership token" },
     },
     async run(args) {
       const name = args.requirePositional(0, "session name");
-      await runWatchLoop(name, {
-        intervalMs: args.number("interval") ?? 500,
-        stopOnExit: args.boolean("stop-on-exit", true),
-        ...(args.string("image") ? { image: args.string("image") as RenderFormat } : {}),
-        ...(args.number("max-frames") !== undefined
-          ? { maxFrames: args.number("max-frames") }
-          : {}),
-        ...(args.number("duration") !== undefined ? { durationMs: args.number("duration") } : {}),
-        ...(args.number("keep") !== undefined ? { keep: args.number("keep") } : {}),
-        ...(args.string("theme") ? { theme: args.string("theme") } : {}),
-        ...(args.number("scale") !== undefined ? { scale: args.number("scale") } : {}),
-      });
+      await runWatchLoop(
+        name,
+        {
+          intervalMs: args.number("interval") ?? 500,
+          stopOnExit: args.boolean("stop-on-exit", true),
+          ...(args.string("image") ? { image: args.string("image") as RenderFormat } : {}),
+          ...(args.number("max-frames") !== undefined
+            ? { maxFrames: args.number("max-frames") }
+            : {}),
+          ...(args.number("duration") !== undefined ? { durationMs: args.number("duration") } : {}),
+          ...(args.number("keep") !== undefined ? { keep: args.number("keep") } : {}),
+          ...(args.string("theme") ? { theme: args.string("theme") } : {}),
+          ...(args.number("scale") !== undefined ? { scale: args.number("scale") } : {}),
+        },
+        args.string("token"),
+      );
       return 0;
     },
   },
@@ -1037,20 +1271,50 @@ const COMMANDS: Record<string, Command> = {
   diff: {
     summary: "Compare two frames, or a frame against the live screen",
     usage: "tui diff <session> [refA] [refB]",
-    options: { json: { type: "boolean", describe: "emit machine-readable JSON" } },
+    options: {
+      mode: { type: "string", describe: "compare text (default), ansi or complete state" },
+      json: { type: "boolean", describe: "emit machine-readable JSON" },
+    },
     async run(args) {
       const name = args.requirePositional(0, "session name");
       assertName(name);
       const refA = args.positional(1) ?? "-1";
       const refB = args.positional(2);
 
-      const before = await readFrameText(await resolveFrame(name, refA));
+      const mode = args.string("mode") ?? "text";
+      if (mode !== "text" && mode !== "ansi" && mode !== "state") {
+        throw new UsageError("--mode must be text, ansi or state");
+      }
+      const frameA = await resolveFrame(name, refA);
+      const before =
+        mode === "text"
+          ? await readFrameText(frameA)
+          : mode === "ansi"
+            ? await readFrameAnsi(frameA)
+            : comparableState(
+                (await readFrameState(frameA)) ??
+                  (() => {
+                    throw new UsageError(`frame ${frameA.id} has no state capture`);
+                  })(),
+              );
       let after: string;
       if (refB === undefined || refB === "live") {
         await requireSession(name);
-        after = (await capture(name)).text;
+        const live = await capture(name);
+        after = mode === "text" ? live.text : mode === "ansi" ? live.ansi : comparableState(live);
       } else {
-        after = await readFrameText(await resolveFrame(name, refB));
+        const frameB = await resolveFrame(name, refB);
+        after =
+          mode === "text"
+            ? await readFrameText(frameB)
+            : mode === "ansi"
+              ? await readFrameAnsi(frameB)
+              : comparableState(
+                  (await readFrameState(frameB)) ??
+                    (() => {
+                      throw new UsageError(`frame ${frameB.id} has no state capture`);
+                    })(),
+                );
       }
 
       const result = diffText(before, after);
@@ -1164,12 +1428,22 @@ const COMMANDS: Record<string, Command> = {
     options: { all: { type: "boolean", describe: "clean every stored session" } },
     async run(args) {
       if (args.boolean("all")) {
+        let names: string[];
+        try {
+          names = (await readdir(sessionsRoot(), { withFileTypes: true }))
+            .filter((entry) => entry.isDirectory())
+            .map((entry) => entry.name);
+        } catch {
+          names = [];
+        }
+        for (const name of names) await stopWatcher(name);
         await rm(`${rootDir()}/sessions`, { recursive: true, force: true });
         output("removed every stored frame");
         return 0;
       }
       const name = args.requirePositional(0, "session name");
       assertName(name);
+      await stopWatcher(name);
       await rm(sessionDir(name), { recursive: true, force: true });
       output(`removed artifacts for "${name}"`);
       return 0;
@@ -1207,8 +1481,15 @@ const COMMANDS: Record<string, Command> = {
          so a missing rasterizer must not fail a CI run that never asks for an image. */
       const checks: { name: string; ok: boolean; required: boolean; detail: string }[] = [];
 
+      let tmuxOkay = false;
       try {
-        checks.push({ name: "tmux", ok: true, required: true, detail: await tmuxVersion() });
+        checks.push({
+          name: "tmux",
+          ok: true,
+          required: true,
+          detail: await requireSupportedTmux(),
+        });
+        tmuxOkay = true;
       } catch (error) {
         checks.push({
           name: "tmux",
@@ -1216,6 +1497,24 @@ const COMMANDS: Record<string, Command> = {
           required: true,
           detail: (error as Error).message,
         });
+      }
+
+      if (tmuxOkay) {
+        try {
+          checks.push({
+            name: "tmux canary",
+            ok: true,
+            required: true,
+            detail: await runTmuxCanary(),
+          });
+        } catch (error) {
+          checks.push({
+            name: "tmux canary",
+            ok: false,
+            required: true,
+            detail: (error as Error).message,
+          });
+        }
       }
 
       const terminfo = Bun.spawn(["infocmp", "tmux-256color"], {
@@ -1282,7 +1581,7 @@ function helpText(commandName?: string): string {
     .map(([name, command]) => [`  ${name}`, command.summary]);
 
   return [
-    "tui-driver — drive, see and snapshot any TUI through tmux",
+    "tui-driver — drive, inspect and test cell-grid TUIs through tmux",
     "",
     "usage: tui <command> [options]",
     "",

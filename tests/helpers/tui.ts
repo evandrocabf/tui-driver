@@ -2,6 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { parseAnsiScreen } from "../../src/ansi.js";
 import type { Snapshot } from "../../src/capture.js";
 
 export const MENU_FIXTURE = join(import.meta.dir, "..", "fixtures", "menu.py");
@@ -89,6 +90,7 @@ export async function captureOutput<T>(run: () => Promise<T>): Promise<CapturedR
 export function makeSnapshot(overrides: Partial<Snapshot> = {}): Snapshot {
   const text = overrides.text ?? "hello";
   return {
+    schemaVersion: 1,
     session: "app",
     capturedAt: "2026-08-10T00:00:00.000Z",
     capturedAtMs: 0,
@@ -105,6 +107,8 @@ export function makeSnapshot(overrides: Partial<Snapshot> = {}): Snapshot {
     mouse: { any: true, standard: false, button: true, all: false, sgr: true, utf8: false },
     ansi: text,
     hash: "abc123",
+    stateHash: "state123",
+    grid: parseAnsiScreen(overrides.ansi ?? text, overrides.cols ?? 64),
     ...overrides,
     text,
   };

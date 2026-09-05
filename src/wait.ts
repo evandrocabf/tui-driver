@@ -23,6 +23,12 @@ export interface WaitOptions {
   exit?: boolean;
   /** Wait until the screen has not changed for this many milliseconds. */
   stableMs?: number;
+  /** Wait until the complete pane state differs from this snapshot state hash. */
+  changedFrom?: string;
+  /** Wait for a specific cursor position or visibility. */
+  cursor?: Partial<Snapshot["cursor"]>;
+  /** Wait for the alternate screen to be active or inactive. */
+  alternateScreen?: boolean;
   /** Treat {@link WaitOptions.text} and {@link WaitOptions.gone} as regular expressions. */
   regex?: boolean;
   /** Match case-insensitively. */
@@ -78,7 +84,7 @@ export async function waitUntilDrawn(
  * Poll a session until every requested condition holds, or the timeout runs out.
  *
  * Stability is tracked across the whole wait rather than measured at the end: each capture is
- * content-hashed, and the clock restarts only when the hash changes. That way `--stable 300ms`
+ * state-hashed, and the clock restarts when content, cursor, modes, size or exit state changes. That way `--stable 300ms`
  * means "300ms since the last actual repaint", not "300ms since we started looking".
  *
  * Never throws on a condition that fails to hold — the caller turns {@link WaitResult.ok} into the
@@ -99,8 +105,8 @@ export async function waitFor(name: string, options: WaitOptions): Promise<WaitR
 
   for (;;) {
     const now = Date.now();
-    if (snapshot.hash !== lastHash) {
-      lastHash = snapshot.hash;
+    if (snapshot.stateHash !== lastHash) {
+      lastHash = snapshot.stateHash;
       lastChangeAt = now;
     }
 
@@ -119,6 +125,33 @@ export async function waitFor(name: string, options: WaitOptions): Promise<WaitR
     }
 
     if (options.exit && !snapshot.dead) pending.push("process still running");
+
+    if (options.changedFrom !== undefined && snapshot.stateHash === options.changedFrom) {
+      pending.push(`state still has hash ${options.changedFrom}`);
+    }
+
+    if (options.cursor?.x !== undefined && snapshot.cursor.x !== options.cursor.x) {
+      pending.push(`cursor x is ${snapshot.cursor.x}, expected ${options.cursor.x}`);
+    }
+    if (options.cursor?.y !== undefined && snapshot.cursor.y !== options.cursor.y) {
+      pending.push(`cursor y is ${snapshot.cursor.y}, expected ${options.cursor.y}`);
+    }
+    if (
+      options.cursor?.visible !== undefined &&
+      snapshot.cursor.visible !== options.cursor.visible
+    ) {
+      pending.push(
+        `cursor visibility is ${snapshot.cursor.visible}, expected ${options.cursor.visible}`,
+      );
+    }
+    if (
+      options.alternateScreen !== undefined &&
+      snapshot.alternateScreen !== options.alternateScreen
+    ) {
+      pending.push(
+        `alternate screen is ${snapshot.alternateScreen}, expected ${options.alternateScreen}`,
+      );
+    }
 
     if (options.stableMs !== undefined && now - lastChangeAt < options.stableMs) {
       pending.push(`screen changed ${now - lastChangeAt}ms ago`);

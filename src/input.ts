@@ -10,7 +10,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { UsageError } from "./errors.js";
+import { ConditionError, UsageError } from "./errors.js";
 import {
   clickSequence,
   encodeMouseEvent,
@@ -218,6 +218,9 @@ export async function queryMouseModes(name: string): Promise<MouseModes> {
     "#{mouse_utf8_flag}",
   ].join(" ");
   const result = await tmux(["display-message", "-p", "-t", paneTarget(name), format]);
+  if (result.code !== 0) {
+    throw new UsageError(result.stderr.trim() || `cannot query mouse modes for "${name}"`);
+  }
   const fields = result.stdout.trim().split(/\s+/);
   return {
     any: fields[0] === "1",
@@ -235,11 +238,66 @@ export async function queryMouseModes(name: string): Promise<MouseModes> {
  * Sent as hex through `send-keys -H`, which is the only way to deliver arbitrary bytes without tmux
  * interpreting them as key names.
  */
-async function sendRawBytes(name: string, sequences: readonly number[][]): Promise<void> {
+export async function sendRawBytes(
+  name: string,
+  sequences: readonly (readonly number[])[],
+): Promise<void> {
   const target = paneTarget(name);
   for (const bytes of sequences) {
+    if (bytes.length === 0) throw new UsageError("a raw byte sequence cannot be empty");
+    if (bytes.some((byte) => !Number.isInteger(byte) || byte < 0 || byte > 255)) {
+      throw new UsageError("raw bytes must be integers from 0 to 255");
+    }
     await tmuxOrThrow(["send-keys", "-t", target, "-H", ...toHexArgs(bytes)]);
   }
+}
+
+/** Send the standard terminal focus-in or focus-out sequence. */
+export async function sendFocus(name: string, focused: boolean): Promise<void> {
+  await sendRawBytes(name, [[0x1b, 0x5b, focused ? 0x49 : 0x4f]]);
+}
+
+export type KittyKeyEventType = "press" | "repeat" | "release";
+
+/** Send one key event using Kitty's CSI-u encoding, including repeat and release events. */
+export async function sendKittyKeyEvent(
+  name: string,
+  codePoint: number,
+  modifiers: readonly string[] = [],
+  event: KittyKeyEventType = "press",
+): Promise<void> {
+  await sendRawBytes(name, [kittyKeySequence(codePoint, modifiers, event)]);
+}
+
+/** Build the exact CSI-u bytes for a Kitty keyboard event. */
+export function kittyKeySequence(
+  codePoint: number,
+  modifiers: readonly string[] = [],
+  event: KittyKeyEventType = "press",
+): number[] {
+  if (!Number.isInteger(codePoint) || codePoint < 0 || codePoint > 0x10ffff) {
+    throw new UsageError(`invalid Unicode code point: ${codePoint}`);
+  }
+  const bits: Record<string, number> = {
+    shift: 1,
+    alt: 2,
+    option: 2,
+    ctrl: 4,
+    control: 4,
+    super: 8,
+    hyper: 16,
+    meta: 32,
+    caps: 64,
+    num: 128,
+  };
+  let modifierValue = 1;
+  for (const raw of modifiers) {
+    const bit = bits[raw.toLowerCase()];
+    if (bit === undefined) throw new UsageError(`unknown Kitty key modifier: ${raw}`);
+    modifierValue += bit;
+  }
+  const eventValue = event === "press" ? 1 : event === "repeat" ? 2 : 3;
+  return [0x1b, ...Buffer.from(`[${codePoint};${modifierValue}:${eventValue}u`, "ascii")];
 }
 
 /** Shared options for the mouse commands. */
@@ -250,13 +308,39 @@ export interface MouseSendOptions {
   modes?: MouseModes;
   /** Pause between the events that make up one gesture. */
   delayMs?: number;
+  /** Deliver the event even when the application has not enabled mouse reporting. */
+  force?: boolean;
 }
 
-/** Decide which wire encoding to use: explicit, from supplied modes, or by asking tmux. */
+/** Parse a public mouse encoding without letting arbitrary strings fall through as x10. */
+export function parseMouseEncoding(input: string | undefined): MouseEncoding | undefined {
+  if (input === undefined) return undefined;
+  if (input === "sgr" || input === "utf8" || input === "x10") return input;
+  throw new UsageError(`unknown mouse encoding: ${input} (use sgr, utf8 or x10)`);
+}
+
+/** Decide which wire encoding to use after proving that the application accepts mouse input. */
 async function encodingFor(name: string, options: MouseSendOptions): Promise<MouseEncoding> {
-  if (options.encoding) return options.encoding;
   const modes = options.modes ?? (await queryMouseModes(name));
-  return pickEncoding(modes);
+  if (!modes.any && !options.force) {
+    throw new ConditionError(
+      "this TUI has not enabled mouse reporting; pass --force only when raw delivery is intentional",
+    );
+  }
+  return options.encoding ?? pickEncoding(modes);
+}
+
+function assertPoint(x: number, y: number): void {
+  if (!Number.isInteger(x) || !Number.isInteger(y) || x < 0 || y < 0) {
+    throw new UsageError(`mouse coordinates must be non-negative integers, got ${x},${y}`);
+  }
+}
+
+function positiveInteger(value: number, label: string): number {
+  if (!Number.isInteger(value) || value < 1) {
+    throw new UsageError(`${label} must be a positive integer`);
+  }
+  return value;
 }
 
 /**
@@ -275,8 +359,9 @@ export async function mouseClick(
   modifiers: MouseModifiers,
   options: MouseSendOptions & { count?: number } = {},
 ): Promise<MouseEncoding> {
+  assertPoint(x, y);
   const encoding = await encodingFor(name, options);
-  const count = Math.max(1, options.count ?? 1);
+  const count = positiveInteger(options.count ?? 1, "click count");
   for (let index = 0; index < count; index += 1) {
     await sendRawBytes(name, clickSequence(x, y, button, modifiers, encoding));
     if (index + 1 < count) await sleep(options.delayMs ?? 40);
@@ -297,6 +382,7 @@ export async function mouseMove(
   modifiers: MouseModifiers,
   options: MouseSendOptions & { button?: MouseButton } = {},
 ): Promise<MouseEncoding> {
+  assertPoint(x, y);
   const encoding = await encodingFor(name, options);
   const button = options.button ?? "none";
   await sendRawBytes(name, [
@@ -322,8 +408,10 @@ export async function mouseDrag(
   options: MouseSendOptions & { steps?: number } = {},
 ): Promise<MouseEncoding> {
   if (isWheel(button)) throw new UsageError("drag requires a real button, not a wheel");
+  assertPoint(from.x, from.y);
+  assertPoint(to.x, to.y);
   const encoding = await encodingFor(name, options);
-  const steps = Math.max(1, options.steps ?? 4);
+  const steps = positiveInteger(options.steps ?? 4, "drag steps");
   const delay = options.delayMs ?? 20;
 
   await sendRawBytes(name, [
@@ -360,9 +448,10 @@ export async function mouseScroll(
   modifiers: MouseModifiers,
   options: MouseSendOptions = {},
 ): Promise<MouseEncoding> {
+  assertPoint(x, y);
   const encoding = await encodingFor(name, options);
   const button = `wheel-${direction}` as MouseButton;
-  const times = Math.max(1, amount);
+  const times = positiveInteger(amount, "scroll amount");
   for (let index = 0; index < times; index += 1) {
     await sendRawBytes(name, [
       encodeMouseEvent({ x, y, button, action: "press", modifiers }, encoding),

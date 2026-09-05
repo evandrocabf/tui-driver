@@ -6,6 +6,7 @@ import {
   assertLabel,
   listFrames,
   readFrameAnsi,
+  readFrameState,
   readFrameText,
   resolveFrame,
   saveFrame,
@@ -58,6 +59,8 @@ describe("saveFrame", () => {
     expect(first.kind).toBe("snap");
     expect(await readFrameText(first)).toBe("one\n");
     expect(await readFrameAnsi(first)).toBe("one");
+    expect((await readFrameState(first))?.grid.lines[0]?.runs[0]?.text).toBe("one");
+    expect(first.stateHash).toBe("state123");
     expect(first.files.image).toBeUndefined();
   });
 
@@ -110,5 +113,13 @@ describe("resolveFrame", () => {
   test("reports an unknown reference and an empty session", () => {
     expect(resolveFrame(SESSION, "nope")).rejects.toThrow(/no frame matching/);
     expect(resolveFrame("never-recorded", "last")).rejects.toThrow(/no frames recorded/);
+  });
+});
+
+describe("readFrameState", () => {
+  test("treats a torn structured snapshot as unavailable", async () => {
+    const frame = saved[0]!;
+    await Bun.write(frame.files.state!, "{torn");
+    expect(await readFrameState(frame)).toBeUndefined();
   });
 });

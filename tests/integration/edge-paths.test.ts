@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdir } from "node:fs/promises";
+import { mkdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 
 import { capture } from "../../src/capture.js";
@@ -8,7 +8,7 @@ import { DependencyError, SessionError } from "../../src/errors.js";
 import { listFrames, saveFrame } from "../../src/frames.js";
 import { detectBackends, svgToPng } from "../../src/png.js";
 import { readMeta, writeMeta } from "../../src/meta.js";
-import { framesIndexPath, watcherPath } from "../../src/paths.js";
+import { framesIndexPath, sessionDir, watcherPath } from "../../src/paths.js";
 import { requireSession, startSession, stopSession } from "../../src/session.js";
 import { ensureConfig, tmuxOrThrow } from "../../src/tmux.js";
 import { readWatcher } from "../../src/watch.js";
@@ -161,6 +161,42 @@ describe.skipIf(!TOOLS_AVAILABLE)("edge paths", () => {
 
       await stopSession(name, { purge: true });
     }, 40_000);
+
+    test("concurrent captures reserve distinct frame ids", async () => {
+      const name = "frame-concurrent";
+      await startSession({ name, argv: ["sleep", "30"], cols: 40, rows: 10 });
+      const snapshot = await capture(name);
+      const records = await Promise.all(
+        Array.from({ length: 12 }, () =>
+          saveFrame(name, snapshot, { kind: "snap", label: "same" }),
+        ),
+      );
+      expect(new Set(records.map((record) => record.id)).size).toBe(records.length);
+      expect(await listFrames(name)).toHaveLength(records.length);
+      await stopSession(name, { purge: true });
+    }, 40_000);
+  });
+
+  describe("private state", () => {
+    test("uses private modes and never persists environment values", async () => {
+      const name = "private-state";
+      const meta = await startSession({
+        name,
+        argv: ["sleep", "30"],
+        cols: 40,
+        rows: 10,
+        env: { API_TOKEN: "super-secret" },
+      });
+      expect(meta.env["API_TOKEN"]).toBe("<redacted>");
+      const stored = await readMeta(name);
+      expect(stored?.env["API_TOKEN"]).toBe("<redacted>");
+      expect((await stat(sessionDir(name))).mode & 0o777).toBe(0o700);
+      expect((await stat(join(sessionDir(name), "session.json"))).mode & 0o777).toBe(0o600);
+      expect(await Bun.file(join(sessionDir(name), "session.json")).text()).not.toContain(
+        "super-secret",
+      );
+      await stopSession(name, { purge: true });
+    }, 30_000);
   });
 
   describe("a recorder whose process is gone", () => {

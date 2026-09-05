@@ -17,7 +17,7 @@ steps:
   - wait: { stable: 250ms }
   - expect: { text: "ACTIVATED: Reports" }
   - expect: { notText: "Traceback" }
-  - snap: { label: 02-reports, png: true }
+  - snap: { label: 02-reports, svg: true }
 
   - golden: menu-reports
 

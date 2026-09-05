@@ -38,7 +38,11 @@ export interface SessionMeta {
 /** Write a session's metadata, creating its directory if this is the first write. */
 export async function writeMeta(meta: SessionMeta): Promise<void> {
   await ensureDir(sessionDir(meta.name));
-  await writeJson(metaPath(meta.name), meta);
+  await writeJson(metaPath(meta.name), {
+    ...meta,
+    /* Values can be credentials. They are needed only for new-session and must not be persisted. */
+    env: Object.fromEntries(Object.keys(meta.env).map((key) => [key, "<redacted>"])),
+  });
 }
 
 /**

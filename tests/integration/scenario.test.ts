@@ -9,6 +9,7 @@ import {
   FIXTURE_COLS,
   FIXTURE_ROWS,
   MENU_FIXTURE,
+  MOUSE_FIXTURE,
   restoreHome,
   TOOLS_AVAILABLE,
 } from "../helpers/tui.js";
@@ -108,6 +109,15 @@ describe.skipIf(!TOOLS_AVAILABLE)("scenario runner", () => {
       ["- not a mapping\n", /scenario must be a mapping/],
       [`name: ok\ncommand: [{}]\nsteps: []\n`, /must be a string/],
       [`name: ok\ncommand: ["sleep","1"]\nenv: notamapping\nsteps: []\n`, /must be a mapping/],
+      [`name: ok\ncommand: ["sleep","1"]\nunknown: true\nsteps: []\n`, /unknown field/],
+      [
+        `schemaVersion: 9\ncommand: ["sleep","1"]\nsteps: []\n`,
+        /unsupported scenario schemaVersion/,
+      ],
+      [
+        `name: ok\ncommand: ["sleep","1"]\nsteps:\n  - keys: q\n    sleep: 1ms\n`,
+        /exactly one action/,
+      ],
     ];
 
     for (const [body, expected] of cases) {
@@ -191,14 +201,18 @@ steps:
     expect(report.ok).toBe(true);
   }, 60_000);
 
-  test("creates a golden on the first run and matches it on the second", async () => {
+  test("creates a golden only in update mode and matches it on the next run", async () => {
     const path = await writeScenario(
       "golden",
       scenarioYaml("scn-golden", "  - golden: reports-screen\n"),
     );
     const outDir = join(workDir, "out-golden");
 
-    const first = await runScenario(path, { outDir });
+    const missing = await runScenario(path, { outDir });
+    expect(missing.ok).toBe(false);
+    expect(missing.steps.at(-1)?.detail).toContain("--update-golden");
+
+    const first = await runScenario(path, { outDir, updateGolden: true });
     expect(first.ok).toBe(true);
     expect(first.steps.at(-1)?.detail).toContain("created golden");
 
@@ -257,18 +271,67 @@ steps:
     expect(failing?.action).toBe("expect");
     expect(failing?.detail).toContain("NEVER ON SCREEN");
     expect(failing?.detail).toContain("SELECTED");
+    expect(failing?.artifacts).toHaveLength(4);
+    for (const artifact of failing?.artifacts ?? []) {
+      expect(await Bun.file(artifact).exists()).toBe(true);
+    }
     /* The `keys` step after the failure never ran. */
     expect(report.steps.some((step) => step.action === "keys" && step.index > 10)).toBe(false);
   }, 60_000);
 
-  test("rejects an unknown step and a missing file", async () => {
+  test("asserts cursor, styled cells, regions and match counts", async () => {
+    const path = await writeScenario(
+      "structured-expect",
+      `name: structured-expect
+session: scn-structured
+command: ["sh", "-c", "printf ABC; cat"]
+size: 40x10
+steps:
+  - wait: { text: "ABC", timeout: 5s }
+  - expect:
+      text: "ABC"
+      count: 1
+      cursor: { x: 3, y: 0, visible: true }
+      cell: { x: 0, y: 0, text: "A", bold: false, fg: default }
+      region: { x: 0, y: 0, width: 3, height: 1, text: "ABC" }
+`,
+    );
+    const report = await runScenario(path, { outDir: join(workDir, "out-structured") });
+    expect(report.ok).toBe(true);
+  }, 30_000);
+
+  test("supports masks and state goldens without silently creating a baseline", async () => {
+    const path = await writeScenario(
+      "state-golden",
+      `schemaVersion: 1
+name: state-golden
+session: scn-state-golden
+command: ["sh", "-c", "printf ID-123; cat"]
+size: 40x10
+masks:
+  - { pattern: '\\d+', replacement: "<id>", regex: true }
+steps:
+  - wait: { text: "ID-123", timeout: 5s }
+  - golden: { label: state, format: state }
+`,
+    );
+    const outDir = join(workDir, "out-state-golden");
+    expect((await runScenario(path, { outDir })).ok).toBe(false);
+    expect((await runScenario(path, { outDir, updateGolden: true })).ok).toBe(true);
+    const golden = await Bun.file(join(workDir, "golden", "state.json")).text();
+    expect(golden).toContain("<id>");
+    expect(golden).not.toContain("ID-123");
+    expect((await runScenario(path, { outDir })).ok).toBe(true);
+  }, 60_000);
+
+  test("rejects an unknown step before launch and a missing file", async () => {
     const path = await writeScenario(
       "unknown",
       scenarioYaml("scn-unknown", "  - teleport: somewhere\n"),
     );
-    const report = await runScenario(path, { outDir: join(workDir, "out-unknown") });
-    expect(report.ok).toBe(false);
-    expect(report.steps.at(-1)?.detail).toContain("unknown scenario step: teleport");
+    expect(runScenario(path, { outDir: join(workDir, "out-unknown") })).rejects.toThrow(
+      "unknown scenario step: teleport",
+    );
 
     expect(runScenario(join(workDir, "missing.yaml"))).rejects.toThrow(/scenario not found/);
   }, 60_000);
@@ -279,6 +342,126 @@ steps:
     await runScenario(path, { outDir: join(workDir, "out-cleanup") });
     expect(await listSessionNames()).not.toContain("scn-cleanup");
   }, 60_000);
+
+  test("drives raw bytes, focus and Kitty key events from scenario-relative inputs", async () => {
+    await Bun.write(join(workDir, "protocol-byte.bin"), new Uint8Array([0x43]));
+    const path = await writeScenario(
+      "protocol-steps",
+      `name: protocol-steps
+session: scn-protocol
+command: ["bash", ${JSON.stringify(MOUSE_FIXTURE)}]
+size: 80x12
+settle: 0ms
+steps:
+  - wait: { text: "MOUSE ECHO READY", timeout: 5s }
+  - bytes: { hex: "41" }
+  - bytes: { base64: "Qg==" }
+  - bytes: { file: "protocol-byte.bin" }
+  - focus: in
+  - focus: out
+  - keyEvent: { character: "D", event: repeat, modifiers: [ctrl, shift] }
+  - keyEvent: { codePoint: 69, event: release, modifiers: alt }
+  - wait: { text: "^[[69;3:3u", timeout: 5s }
+  - expect: { text: "ABC^[[I^[[O^[[68;6:2u^[[69;3:3u" }
+`,
+    );
+
+    const report = await runScenario(path, { outDir: join(workDir, "out-protocol") });
+    expect(report.steps.filter((step) => !step.ok)).toEqual([]);
+    expect(report.ok).toBe(true);
+  }, 30_000);
+
+  test("rejects malformed exact-input scenario steps with precise failures", async () => {
+    const cases = [
+      ["bytes: {}", /exactly one/],
+      ['bytes: { hex: "A" }', /byte pairs/],
+      ["focus: sideways", /must be in or out/],
+      ['keyEvent: { character: "A", codePoint: 65 }', /exactly one/],
+      ['keyEvent: { character: "AB" }', /one character/],
+      ["keyEvent: { codePoint: 65, event: hold }", /press, repeat or release/],
+    ] as const;
+
+    for (let index = 0; index < cases.length; index += 1) {
+      const [step, message] = cases[index] ?? ["", /never/];
+      const path = await writeScenario(
+        `bad-protocol-${index}`,
+        `name: bad-protocol-${index}
+session: scn-bad-protocol-${index}
+command: ["sh", "-c", "printf READY; cat"]
+settle: 0ms
+steps:
+  - ${step}
+`,
+      );
+      const report = await runScenario(path, {
+        outDir: join(workDir, `out-bad-protocol-${index}`),
+      });
+      expect(report.ok).toBe(false);
+      expect(report.steps[0]?.detail).toMatch(message);
+    }
+  }, 60_000);
+
+  test("asserts indexed and RGB colors, styles and cursor tuple form", async () => {
+    const shell = "printf '\\033[1;3;4;9;31mA\\033[0;38;2;1;2;3mB\\033[0m'; cat";
+    const path = await writeScenario(
+      "rich-cells",
+      `name: rich-cells
+session: scn-rich-cells
+shell: ${JSON.stringify(shell)}
+size: 40x10
+settle: 0ms
+steps:
+  - wait: { text: "AB", timeout: 5s }
+  - expect: { cursor: [2, 0] }
+  - expect:
+      cell: { x: 0, y: 0, text: "A", fg: 1, bg: default, bold: true, dim: false, italic: true, underline: true, reverse: false, hidden: false, strike: true }
+  - expect: { cell: { x: 1, y: 0, text: "B", fg: "#010203" } }
+`,
+    );
+
+    const report = await runScenario(path, { outDir: join(workDir, "out-rich-cells") });
+    expect(report.steps.filter((step) => !step.ok)).toEqual([]);
+    expect(report.ok).toBe(true);
+  }, 30_000);
+
+  test("reports each structured assertion contract violation", async () => {
+    const cases = [
+      ["cursor: [4, 0]", /cursor x/],
+      ["cursor: { y: 1 }", /cursor y/],
+      ["cursor: { visible: false }", /cursor visible/],
+      ["cursor: [-1, 0]", /non-negative integers/],
+      ['cursor: { visible: "false" }', /must be a boolean/],
+      ['cell: { x: 0, y: 0, text: "Z" }', /cell 0,0 text/],
+      ["cell: { x: 0, y: 0, bold: true }", /bold=true/],
+      ["cell: { x: 0, y: 0, fg: 1 }", /fg=1/],
+      ["cell: { x: 0 }", /needs x and y/],
+      ['region: { x: 0, y: 0, width: 3, text: "ABC" }', /needs x, y, width and height/],
+      ['region: { x: 0, y: 0, width: 0, height: 1, text: "" }', /positive integers/],
+      ['region: { x: 39, y: 0, width: 2, height: 1, text: "" }', /extends outside/],
+      ['region: { x: 0, y: 0, width: 3, height: 1, text: "XYZ" }', /expected region text/],
+      ["count: 1", /requires expect.text/],
+      ['text: "ABC", count: 2', /expected 2 matches/],
+      ['notText: "ABC"', /did not expect/],
+    ] as const;
+
+    for (let index = 0; index < cases.length; index += 1) {
+      const [expectation, message] = cases[index] ?? ["", /never/];
+      const path = await writeScenario(
+        `bad-expect-${index}`,
+        `name: bad-expect-${index}
+session: scn-bad-expect-${index}
+command: ["sh", "-c", "printf ABC; cat"]
+size: 40x10
+settle: 0ms
+steps:
+  - expect: { ${expectation} }
+`,
+      );
+      const report = await runScenario(path, { outDir: join(workDir, `out-bad-expect-${index}`) });
+      expect(report.ok).toBe(false);
+      expect(report.steps[0]?.detail).toMatch(message);
+    }
+  }, 90_000);
 
   test("runs every step kind the format documents", async () => {
     const path = await writeScenario(
@@ -295,7 +478,7 @@ steps:
   - type: { text: "x" }
   - paste: { text: "y", bracketed: false }
   - move: { x: 10, y: 5 }
-  - drag: { from: [2, 3], to: [8, 6], steps: 2 }
+  - drag: { from: { x: 2, y: 3 }, to: { x: 8, y: 6 }, steps: 2 }
   - scroll: { direction: down, amount: 2 }
   - keys: "Down Down"
   - wait: { stable: 200ms }

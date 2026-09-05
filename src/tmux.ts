@@ -8,7 +8,7 @@
 import { existsSync } from "node:fs";
 
 import { DependencyError } from "./errors.js";
-import { ensureDir } from "./util.js";
+import { ensureDir, writePrivateFile } from "./util.js";
 import { rootDir, socketPath, tmuxConfPath } from "./paths.js";
 
 /**
@@ -34,7 +34,9 @@ set -g set-titles off
 set -g visual-bell off
 set -g visual-activity off
 set -g bell-action none
-set -g focus-events off
+set -g focus-events on
+set -s extended-keys on
+set -g extended-keys-format csi-u
 set -g base-index 0
 set -g repeat-time 0
 set -g assume-paste-time 0
@@ -94,7 +96,7 @@ export async function ensureConfig(): Promise<void> {
   const file = Bun.file(path);
   const current = (await file.exists()) ? await file.text() : "";
   if (current !== TMUX_CONF) {
-    await Bun.write(path, TMUX_CONF);
+    await writePrivateFile(path, TMUX_CONF);
     if (await serverRunning()) {
       await rawTmux(["source-file", path]);
     }

@@ -14,7 +14,7 @@ import { armWatchdog, defaultTtlMs, EXPIRES_OPTION, NEVER, setDeadline } from ".
 import { readMeta, writeMeta, type SessionMeta } from "./meta.js";
 import { pipeLogPath, sessionDir, socketPath } from "./paths.js";
 import { exactTarget, hasSession, listSessionNames, tmux, tmuxOrThrow } from "./tmux.js";
-import { ensureDir, formatElapsed, shellQuote } from "./util.js";
+import { ensureDir, formatElapsed, shellQuote, writePrivateFile } from "./util.js";
 
 /** A session name is also a directory name and a tmux target, so it is kept deliberately narrow. */
 const NAME_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
@@ -153,6 +153,7 @@ export async function startSession(options: StartOptions): Promise<SessionMeta> 
   if (options.rawLog) {
     /* tmux runs this through /bin/sh, so the path has to survive spaces and metacharacters. */
     const target = shellQuote([pipeLogPath(name)]);
+    await writePrivateFile(pipeLogPath(name), "");
     await tmux(["pipe-pane", "-t", `${exactTarget(name)}:`, "-O", `cat >> ${target}`]);
   }
 
@@ -169,7 +170,7 @@ export async function startSession(options: StartOptions): Promise<SessionMeta> 
     cwd,
     cols: options.cols,
     rows: options.rows,
-    env,
+    env: Object.fromEntries(Object.keys(env).map((key) => [key, "<redacted>"])),
     startedAt: new Date(startedAtMs).toISOString(),
     startedAtMs,
     ttlMs,

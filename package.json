@@ -2,7 +2,7 @@
   "name": "tui-driver",
   "version": "0.1.0",
   "private": true,
-  "description": "Drive, see and snapshot any TUI through tmux — built so coding agents can open a terminal UI, look at it and navigate it.",
+  "description": "Drive, inspect and test cell-grid TUIs in a managed tmux PTY from one-shot shell commands.",
   "license": "MIT",
   "author": "Evandro Bezerra Filho",
   "type": "module",

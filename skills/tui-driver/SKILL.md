@@ -1,6 +1,6 @@
 ---
 name: tui-driver
-description: Open, see, click and navigate any terminal UI (TUI) from the shell, and write repeatable TUI tests. Use whenever the task involves running or inspecting a full-screen terminal program — htop, vim, lazygit, a curses/ink/ratatui/opentui app, an installer or a CLI wizard — or asks to screenshot a TUI, click a button in a TUI, check what a TUI renders, drive it with the keyboard or mouse, record what it does over time, or assert that its screen is correct.
+description: Open, inspect, click and navigate cell-grid terminal UIs from the shell, and write repeatable TUI tests. Use whenever the task involves running or inspecting a full-screen terminal program — htop, vim, lazygit, a curses/ink/ratatui/opentui app, an installer or a CLI wizard — or asks to screenshot a TUI, click a button in a TUI, check what a TUI renders, drive it with the keyboard or mouse, record what it does over time, or assert that its screen is correct.
 ---
 
 # Driving a TUI with tui-driver
@@ -15,6 +15,8 @@ the only capability you need.
 project you are working in builds, ships or depends on — an app, a CLI wizard, an installer, or a
 third-party tool like `htop` or `lazygit`. Nothing below asks you to run or test tui-driver itself.
 
+The managed scope is one cell-grid pane under tmux. Terminal graphics and physical-emulator-specific
+behavior are outside that capture; use `tui capabilities <session>` to inspect the live boundary.
 The command is `tui`. If it is not on `PATH`, it can be run from the tui-driver checkout with
 `bun run <tui-driver>/bin/tui.ts` — that path locates _the tool_, and has nothing to do with the
 program under test. `tui doctor` checks the environment; `tui help <command>` lists any options.
@@ -83,7 +85,7 @@ act and observe together. Prefer it over a separate `snap`.
 tui snap app                    # header + plain text (default; this is what you usually want)
 tui snap app --ruler            # with row/column numbers, for aiming clicks
 tui snap app --raw              # screen only, no header
-tui snap app --json             # full metadata: size, cursor, mouse modes, exit status, hash
+tui snap app --json             # versioned metadata, stateHash and styled cell grid
 tui snap app --scrollback 200   # include scrollback history
 tui find app "Settings"         # locate text, get clickable coordinates
 tui find app "^\\s*Error" --regex --all
@@ -110,13 +112,17 @@ tui keys app Escape Tab F5 PPage # esc, pgup, backspace, del … all have friend
 tui keys app j --repeat 10 --delay 30ms
 tui type app "hello world" --enter
 tui paste app --file notes.txt   # bracketed paste, for multi-line input
+tui bytes app --hex "1b 5b 49"  # exact protocol bytes
+tui focus app --in              # focus-in; --out sends focus-out
+tui key-event app A --event repeat --modifiers ctrl
 ```
 
 ## Mouse
 
 The wire encoding is auto-detected from what the TUI itself enabled, so clicks land correctly in
 both modern (SGR) and legacy (x10) applications. If the header says `mouse off`, the application
-does not listen to the mouse and the commands will warn you.
+does not listen to the mouse and the command exits 1 before sending. Use `--force` only when raw
+delivery is intentional. Coordinates and encodings are validated; `--if-hash` rejects a stale view.
 
 ```bash
 tui click app --text "Reports"          # by label (preferred)
@@ -134,14 +140,16 @@ tui scroll app --down --amount 5
 For a TUI that changes on its own — a progress bar, a log tail, a long build:
 
 ```bash
-tui watch app --interval 500ms   # background recorder; saves a frame on every change
+tui watch app --interval 500ms   # samples complete state; saves each observed change
 tui frames app --last 10         # what it captured
 tui frame app -2                 # print the third-newest frame
 tui diff app -1 live             # what changed since the previous frame
 tui watch app --stop
 ```
 
-Frames are content-hashed, so an idle screen costs nothing. Every frame keeps its ANSI form, so
+Frames are state-hashed, so cursor, size, modes and process exit count as changes while an idle
+screen costs nothing. Polling cannot capture a state shorter than its interval. Every frame keeps
+its ANSI and structured cell state, so
 `tui render app <ref> --out shot.png` can rasterise any past frame after the fact.
 
 ## Repeatable tests
@@ -151,6 +159,7 @@ instead of a command sequence. `command` and `cwd` describe _the project's_ prog
 worked out above; `cwd` is relative to the scenario file:
 
 ```yaml
+schemaVersion: 1
 name: settings-smoke
 command: ["npm", "run", "start", "--silent"]
 cwd: ../..
@@ -173,8 +182,11 @@ tui run tests/tui/settings-smoke.yaml                  # exit 1 on the first fai
 tui run tests/tui/settings-smoke.yaml --update-golden  # accept the current screens as the baseline
 ```
 
-Steps available: `wait`, `sleep`, `snap`, `keys`, `type`, `paste`, `click`, `move`, `drag`,
-`scroll`, `resize`, `expect`, `golden`.
+Steps available: `wait`, `sleep`, `snap`, `keys`, `bytes`, `focus`, `keyEvent`, `type`, `paste`,
+`click`, `move`, `drag`, `scroll`, `resize`, `expect`, `golden`. Scenarios validate fields strictly.
+`expect` can assert counts, cursor, styled cells and regions. Goldens support `text`, `ansi` and
+`state`, and are created only with `--update-golden`. Every failed step writes text, ANSI, JSON and
+SVG diagnostics.
 
 **Where the files belong.** Put the scenario in the project under test, next to its other tests —
 `tests/tui/` is a good default. Goldens are written to `golden/` beside the scenario and should be
@@ -195,8 +207,8 @@ Branch on these rather than parsing the output.
   first paint; if the app is slow, add `--wait-text "<something it prints>"`.
 - **Keys seem ignored** — the TUI may debounce. Retry with `--delay 40ms`, and confirm with
   `tui wait app --stable 300ms` that it is not still redrawing.
-- **Clicks do nothing** — check the header for `mouse off`. Many TUIs only enable the mouse in
-  certain modes or need a config flag.
+- **Clicks fail with mouse off** — many TUIs only enable the mouse in certain modes or need a config
+  flag. Fix the application state; use `--force` only for an intentional raw-protocol test.
 - **Session already exists** — a previous run is still inside its lease. `tui ls`, then
   `tui stop <name>` (or `tui gc` to sweep everything already expired).
 - **"session … expired after its lease"** — it was reaped for you. Start it again, with

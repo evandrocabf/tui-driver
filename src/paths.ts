@@ -57,7 +57,7 @@ export function tmuxConfPath(): string {
 }
 
 /** The directory holding one subdirectory per session. */
-function sessionsRoot(): string {
+export function sessionsRoot(): string {
   return join(rootDir(), "sessions");
 }
 

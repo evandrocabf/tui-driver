@@ -1,12 +1,13 @@
 /**
- * The background recorder: a frame saved every time the screen actually changes.
+ * The background recorder: a frame saved for every state change observed at its polling interval.
  *
- * Frames are content-hashed, so an idle TUI costs nothing on disk however long the recorder runs.
+ * Frames are state-hashed, so an idle TUI costs nothing on disk however long the recorder runs.
  * The recorder is a detached child process rather than a thread, so it outlives the command that
  * started it — which is the whole point, and also why it is tracked by pid and reaped deliberately.
  */
 
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { openSync, closeSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -17,7 +18,7 @@ import { listFrames, saveFrame } from "./frames.js";
 import { sessionDir, watcherLogPath, watcherPath } from "./paths.js";
 import type { RenderFormat } from "./render.js";
 import { hasSession } from "./tmux.js";
-import { ensureDir, isProcessAlive, readJson, sleep, writeJson } from "./util.js";
+import { ensureDir, isProcessAlive, readJson, sleep, withFileLock, writeJson } from "./util.js";
 
 /** How the recorder should run. */
 export interface WatcherOptions {
@@ -41,6 +42,8 @@ export interface WatcherOptions {
 
 /** A running recorder, as recorded in the session's `watcher.json`. */
 export interface WatcherState extends WatcherOptions {
+  /** Unique ownership token preventing an old daemon from deleting a replacement's state. */
+  token: string;
   /** The recorder process's pid. */
   pid: number;
   /** The session being recorded. */
@@ -101,43 +104,55 @@ export async function readWatcher(name: string): Promise<WatcherState | undefine
  */
 export async function startWatcher(name: string, options: WatcherOptions): Promise<WatcherState> {
   assertBunRuntime();
-  const existing = await readWatcher(name);
-  if (existing) {
-    throw new UsageError(
-      `a watcher is already recording "${name}" (pid ${existing.pid}) — stop it with: tui watch ${name} --stop`,
-    );
-  }
+  return withFileLock(`${watcherPath(name)}.lock`, async () => {
+    const existing = await readWatcher(name);
+    if (existing) {
+      throw new UsageError(
+        `a watcher is already recording "${name}" (pid ${existing.pid}) — stop it with: tui watch ${name} --stop`,
+      );
+    }
 
-  await ensureDir(sessionDir(name));
-  const logFd = openSync(watcherLogPath(name), "a");
+    await ensureDir(sessionDir(name));
+    const logFd = openSync(watcherLogPath(name), "a", 0o600);
+    const token = randomUUID();
+    const args = [
+      "run",
+      cliEntry(),
+      DAEMON_COMMAND,
+      name,
+      "--interval",
+      String(options.intervalMs),
+      "--token",
+      token,
+    ];
+    if (options.image) args.push("--image", options.image);
+    if (options.maxFrames !== undefined) args.push("--max-frames", String(options.maxFrames));
+    if (options.durationMs !== undefined) args.push("--duration", String(options.durationMs));
+    if (options.keep !== undefined) args.push("--keep", String(options.keep));
+    if (options.theme) args.push("--theme", options.theme);
+    if (options.scale !== undefined) args.push("--scale", String(options.scale));
+    if (!options.stopOnExit) args.push("--no-stop-on-exit");
 
-  const args = ["run", cliEntry(), DAEMON_COMMAND, name, "--interval", String(options.intervalMs)];
-  if (options.image) args.push("--image", options.image);
-  if (options.maxFrames !== undefined) args.push("--max-frames", String(options.maxFrames));
-  if (options.durationMs !== undefined) args.push("--duration", String(options.durationMs));
-  if (options.keep !== undefined) args.push("--keep", String(options.keep));
-  if (options.theme) args.push("--theme", options.theme);
-  if (options.scale !== undefined) args.push("--scale", String(options.scale));
-  if (!options.stopOnExit) args.push("--no-stop-on-exit");
+    const child = spawn(process.execPath, args, {
+      detached: true,
+      stdio: ["ignore", logFd, logFd],
+      env: process.env,
+    });
+    child.unref();
+    closeSync(logFd);
 
-  const child = spawn(process.execPath, args, {
-    detached: true,
-    stdio: ["ignore", logFd, logFd],
-    env: process.env,
+    if (child.pid === undefined) throw new UsageError("failed to spawn the watcher process");
+
+    const state: WatcherState = {
+      ...options,
+      token,
+      pid: child.pid,
+      session: name,
+      startedAt: new Date().toISOString(),
+    };
+    await writeJson(watcherPath(name), state);
+    return state;
   });
-  child.unref();
-  closeSync(logFd);
-
-  if (child.pid === undefined) throw new UsageError("failed to spawn the watcher process");
-
-  const state: WatcherState = {
-    ...options,
-    pid: child.pid,
-    session: name,
-    startedAt: new Date().toISOString(),
-  };
-  await writeJson(watcherPath(name), state);
-  return state;
 }
 
 /**
@@ -149,16 +164,26 @@ export async function startWatcher(name: string, options: WatcherOptions): Promi
  * @returns True if a live recorder was signalled.
  */
 export async function stopWatcher(name: string): Promise<boolean> {
-  const state = await readJson<WatcherState>(watcherPath(name));
-  await rm(watcherPath(name), { force: true });
-  if (!state) return false;
-  if (!isProcessAlive(state.pid, DAEMON_COMMAND)) return false;
-  try {
-    process.kill(state.pid, "SIGTERM");
-    return true;
-  } catch {
-    return false;
-  }
+  return withFileLock(`${watcherPath(name)}.lock`, async () => {
+    const state = await readJson<WatcherState>(watcherPath(name));
+    if (!state) return false;
+    const alive = isProcessAlive(state.pid, DAEMON_COMMAND);
+    if (alive) {
+      try {
+        process.kill(state.pid, "SIGTERM");
+      } catch {
+        await rm(watcherPath(name), { force: true });
+        return false;
+      }
+      const deadline = Date.now() + 1500;
+      while (isProcessAlive(state.pid, DAEMON_COMMAND) && Date.now() < deadline) await sleep(25);
+    }
+    const current = await readJson<WatcherState>(watcherPath(name));
+    if (!current || current.token === state.token || current.pid === state.pid) {
+      await rm(watcherPath(name), { force: true });
+    }
+    return alive;
+  });
 }
 
 /**
@@ -171,7 +196,11 @@ export async function stopWatcher(name: string): Promise<boolean> {
  *
  * @returns How many frames were saved.
  */
-export async function runWatchLoop(name: string, options: WatcherOptions): Promise<number> {
+export async function runWatchLoop(
+  name: string,
+  options: WatcherOptions,
+  ownerToken?: string,
+): Promise<number> {
   let running = true;
   const stop = (): void => {
     running = false;
@@ -192,12 +221,13 @@ export async function runWatchLoop(name: string, options: WatcherOptions): Promi
       let snapshot;
       try {
         snapshot = await capture(name);
-      } catch {
+      } catch (error) {
+        process.stderr.write(`capture failed for "${name}": ${(error as Error).message}\n`);
         break;
       }
 
-      if (snapshot.hash !== lastHash) {
-        lastHash = snapshot.hash;
+      if (snapshot.stateHash !== lastHash) {
+        lastHash = snapshot.stateHash;
         await saveFrame(name, snapshot, {
           kind: "auto",
           ...(options.image ? { image: options.image } : {}),
@@ -219,7 +249,12 @@ export async function runWatchLoop(name: string, options: WatcherOptions): Promi
     process.off("SIGINT", stop);
   }
 
-  await rm(watcherPath(name), { force: true });
+  if (ownerToken) {
+    await withFileLock(`${watcherPath(name)}.lock`, async () => {
+      const current = await readJson<WatcherState>(watcherPath(name));
+      if (current?.token === ownerToken) await rm(watcherPath(name), { force: true });
+    });
+  }
   return saved;
 }
 
@@ -236,6 +271,7 @@ async function pruneFrames(name: string, keep: number): Promise<void> {
   for (const frame of frames.slice(0, excess)) {
     await rm(frame.files.text, { force: true });
     await rm(frame.files.ansi, { force: true });
+    if (frame.files.state) await rm(frame.files.state, { force: true });
     if (frame.files.image) await rm(frame.files.image, { force: true });
   }
 }
