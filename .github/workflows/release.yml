@@ -1,0 +1,124 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: validate release tag
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require an annotated version tag on main
+        run: |
+          version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' package.json | head -n 1)"
+          test "$GITHUB_REF_NAME" = "v$version"
+          test "$(git cat-file -t "$GITHUB_REF_NAME")" = "tag"
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          commit="$(git rev-parse "$GITHUB_REF_NAME^{commit}")"
+          git merge-base --is-ancestor "$commit" origin/main
+
+  build:
+    name: build (${{ matrix.asset }})
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: bun-linux-x64-baseline
+            asset: linux-x64
+          - runner: ubuntu-24.04-arm
+            target: bun-linux-arm64
+            asset: linux-arm64
+          - runner: macos-15-intel
+            target: bun-darwin-x64
+            asset: darwin-x64
+          - runner: macos-15
+            target: bun-darwin-arm64
+            asset: darwin-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.11"
+
+      - name: Install tmux (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux ncurses-term
+
+      - name: Install tmux (macOS)
+        if: runner.os == 'macOS'
+        run: brew install tmux
+
+      - run: bun install --frozen-lockfile
+
+      - name: Build native standalone package
+        run: bun run build:release --target "${{ matrix.target }}"
+
+      - name: Smoke-test standalone package
+        run: |
+          mkdir release-smoke
+          tar -xzf "dist/tui-driver-${{ matrix.asset }}.tar.gz" -C release-smoke
+          scripts/smoke-release.sh release-smoke/tui-driver/bin/tui
+          scripts/test-release-install.sh "dist/tui-driver-${{ matrix.asset }}.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tui-driver-${{ matrix.asset }}
+          path: |
+            dist/tui-driver-${{ matrix.asset }}.tar.gz
+            dist/tui-driver-${{ matrix.asset }}.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: publish GitHub release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify assembled release
+        working-directory: dist
+        run: sha256sum --check *.sha256
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp install.sh dist/install.sh
+          prerelease=()
+          case "$GITHUB_REF_NAME" in
+            *-*) prerelease+=(--prerelease) ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag \
+            --title "tui-driver $GITHUB_REF_NAME" \
+            --generate-notes \
+            --draft \
+            "${prerelease[@]}"
+          gh release edit "$GITHUB_REF_NAME" --draft=false

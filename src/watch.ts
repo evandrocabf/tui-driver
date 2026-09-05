@@ -66,8 +66,23 @@ function cliEntry(): string {
 }
 
 /**
- * The recorder re-executes this CLI as a detached child, which only works under bun: the entry
- * point is TypeScript and the spawn passes bun's `run` subcommand.
+ * Re-execute the recorder through the same distribution that launched this command.
+ *
+ * Source checkouts run the TypeScript entry through Bun. Release builds replace the environment
+ * expression at compile time and invoke the standalone executable directly.
+ */
+export function watcherInvocation(standalone = process.env["TUI_DRIVER_STANDALONE"] === "1"): {
+  command: string;
+  prefix: string[];
+} {
+  if (standalone) {
+    return { command: process.execPath, prefix: [] };
+  }
+  return { command: process.execPath, prefix: ["run", cliEntry()] };
+}
+
+/**
+ * The recorder needs Bun either as the source runtime or embedded in the standalone executable.
  */
 function assertBunRuntime(): void {
   if (!process.versions.bun) {
@@ -115,9 +130,9 @@ export async function startWatcher(name: string, options: WatcherOptions): Promi
     await ensureDir(sessionDir(name));
     const logFd = openSync(watcherLogPath(name), "a", 0o600);
     const token = randomUUID();
+    const invocation = watcherInvocation();
     const args = [
-      "run",
-      cliEntry(),
+      ...invocation.prefix,
       DAEMON_COMMAND,
       name,
       "--interval",
@@ -133,7 +148,7 @@ export async function startWatcher(name: string, options: WatcherOptions): Promi
     if (options.scale !== undefined) args.push("--scale", String(options.scale));
     if (!options.stopOnExit) args.push("--no-stop-on-exit");
 
-    const child = spawn(process.execPath, args, {
+    const child = spawn(invocation.command, args, {
       detached: true,
       stdio: ["ignore", logFd, logFd],
       env: process.env,

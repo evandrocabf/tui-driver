@@ -36,6 +36,16 @@ The tool runs its own tmux server on a private socket with its own config, so it
 disturb tmux sessions you started yourself. The socket lives inside `TUI_DRIVER_HOME`, or under the
 temp directory with a hashed name when that path would exceed the ~108-byte unix socket limit.
 
+## Release installation
+
+The public installer downloads the archive and its `.sha256` file from the same tagged GitHub
+release, rejects unexpected archive paths, checks the embedded platform and architecture metadata,
+and only then switches the active version. The checksum detects corruption and incomplete
+downloads; trust in the artifact still comes from the GitHub repository and its release workflow.
+
+macOS executables have an ad hoc signature with the entitlements required by Bun's JIT. They are
+not signed with an Apple Developer ID and are not notarized.
+
 ## Note on the Chrome rendering backend
 
 When neither `rsvg-convert` nor ImageMagick is installed, PNG rendering falls back to headless Chrome

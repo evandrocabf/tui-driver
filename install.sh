@@ -2,14 +2,14 @@
 #
 # tui-driver installer.
 #
-#   curl -fsSL https://raw.githubusercontent.com/evandrocabf/tui-driver/main/install.sh | bash
+#   curl -fsSL https://github.com/evandrocabf/tui-driver/releases/latest/download/install.sh | bash
 #   ./install.sh --agents claude,codex
 #   ./install.sh --project .
 #
 # It does two separable things:
 #
-#   1. puts `tui` / `tui-driver` on your PATH, as a small shim that execs bun on
-#      the checkout — so `git pull` is the whole update story;
+#   1. downloads and checksum-verifies the release archive for this OS/CPU and
+#      puts its standalone `tui` / `tui-driver` executable on your PATH;
 #   2. links skills/tui-driver/ into wherever your coding agents look for skills.
 #
 # Everything it writes is named as it writes it, `--dry-run` shows the plan
@@ -17,12 +17,13 @@
 
 set -euo pipefail
 
-REPO_URL="${TUI_DRIVER_REPO:-https://github.com/evandrocabf/tui-driver.git}"
+REPOSITORY="${TUI_DRIVER_REPOSITORY:-evandrocabf/tui-driver}"
+RELEASE_BASE="${TUI_DRIVER_RELEASE_BASE:-https://github.com/$REPOSITORY/releases}"
 SKILL_NAME="tui-driver"
 MARKER="tui-driver-installer"
 COPY_STAMP=".tui-driver-installed"
+ROOT_MARKER=".tui-driver-release-install"
 
-MIN_BUN="1.3.11"
 MIN_TMUX="3.2"
 
 # ── options ──────────────────────────────────────────────────────────────────
@@ -33,12 +34,14 @@ NO_AGENTS=0
 NO_BIN=0
 PROJECT_DIR=""
 PREFIX="${XDG_BIN_HOME:-$HOME/.local/bin}"
-SRC_DIR_ARG=""
-GIT_REF=""
+INSTALL_ROOT="${TUI_DRIVER_INSTALL_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/tui-driver}"
+RELEASE_VERSION="${TUI_DRIVER_VERSION:-latest}"
+LOCAL_ARCHIVE=""
 COPY=0
 FORCE=0
 DRY_RUN=0
 UNINSTALL=0
+LOCK_DIR=""
 
 # ── output ───────────────────────────────────────────────────────────────────
 
@@ -79,7 +82,8 @@ ${B}tui-driver installer${R}
   install.sh [options]
 
 ${B}What gets installed${R}
-  the CLI      a \`tui\` / \`tui-driver\` shim in ${PREFIX}
+  the release  a versioned standalone package under ${INSTALL_ROOT}
+  the CLI      \`tui\` / \`tui-driver\` links in ${PREFIX}
   the skill    skills/${SKILL_NAME}/ linked into each agent's skill directory
 
 ${B}Options${R}
@@ -89,11 +93,11 @@ ${B}Options${R}
   --no-agents       install the CLI only
   --no-bin          install the skill only
   --project [DIR]   install into a project (.claude/skills/…) instead of \$HOME
-  --prefix DIR      where the CLI shim goes (default: \$XDG_BIN_HOME or ~/.local/bin)
-  --dir DIR         where to clone the source when not run from a checkout
-                    (default: \$XDG_DATA_HOME/tui-driver or ~/.local/share/tui-driver)
-  --ref REF         git branch/tag/commit to install (implies a clone)
-  --repo URL        clone from a fork instead (or set \$TUI_DRIVER_REPO)
+  --prefix DIR      where the CLI links go (default: \$XDG_BIN_HOME or ~/.local/bin)
+  --install-dir DIR where versioned releases live (default: \$XDG_DATA_HOME/tui-driver)
+  --version VERSION install a release tag such as v0.1.0 (default: latest)
+  --repository REPO download from OWNER/REPO instead
+  --archive FILE    install a local release archive (requires FILE.sha256)
   --copy            copy the skill instead of symlinking it (no live updates)
   --force           replace files this installer does not recognise
   --dry-run         print the plan, change nothing
@@ -102,6 +106,7 @@ ${B}Options${R}
 
 ${B}Examples${R}
   ./install.sh                          # detect agents, link everything
+  ./install.sh --version v0.1.0         # pin an exact release
   ./install.sh --agents claude,codex    # only those two
   ./install.sh --project .              # into the current project instead
   ./install.sh --uninstall --all        # take it all back out
@@ -110,7 +115,9 @@ EOF
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --agents)     AGENTS_ARG="${2:-}"; shift 2 ;;
+    --agents)
+      if [ $# -lt 2 ] || [ -z "$2" ]; then die "--agents needs a value"; fi
+      AGENTS_ARG="$2"; shift 2 ;;
     --agents=*)   AGENTS_ARG="${1#*=}"; shift ;;
     --all)        INSTALL_ALL=1; shift ;;
     --no-agents)  NO_AGENTS=1; shift ;;
@@ -123,14 +130,26 @@ while [ $# -gt 0 ]; do
         PROJECT_DIR="."; shift
       fi ;;
     --project=*)  PROJECT_DIR="${1#*=}"; shift ;;
-    --prefix)     PREFIX="${2:-}"; shift 2 ;;
+    --prefix)
+      if [ $# -lt 2 ] || [ -z "$2" ]; then die "--prefix needs a value"; fi
+      PREFIX="$2"; shift 2 ;;
     --prefix=*)   PREFIX="${1#*=}"; shift ;;
-    --dir)        SRC_DIR_ARG="${2:-}"; shift 2 ;;
-    --dir=*)      SRC_DIR_ARG="${1#*=}"; shift ;;
-    --ref)        GIT_REF="${2:-}"; shift 2 ;;
-    --ref=*)      GIT_REF="${1#*=}"; shift ;;
-    --repo)       REPO_URL="${2:-}"; shift 2 ;;
-    --repo=*)     REPO_URL="${1#*=}"; shift ;;
+    --install-dir)
+      if [ $# -lt 2 ] || [ -z "$2" ]; then die "--install-dir needs a value"; fi
+      INSTALL_ROOT="$2"; shift 2 ;;
+    --install-dir=*) INSTALL_ROOT="${1#*=}"; shift ;;
+    --version)
+      if [ $# -lt 2 ] || [ -z "$2" ]; then die "--version needs a value"; fi
+      RELEASE_VERSION="$2"; shift 2 ;;
+    --version=*)     RELEASE_VERSION="${1#*=}"; shift ;;
+    --repository)
+      if [ $# -lt 2 ] || [ -z "$2" ]; then die "--repository needs a value"; fi
+      REPOSITORY="$2"; RELEASE_BASE="https://github.com/$REPOSITORY/releases"; shift 2 ;;
+    --repository=*) REPOSITORY="${1#*=}"; RELEASE_BASE="https://github.com/$REPOSITORY/releases"; shift ;;
+    --archive)
+      if [ $# -lt 2 ] || [ -z "$2" ]; then die "--archive needs a value"; fi
+      LOCAL_ARCHIVE="$2"; shift 2 ;;
+    --archive=*)     LOCAL_ARCHIVE="${1#*=}"; shift ;;
     --copy)       COPY=1; shift ;;
     --force)      FORCE=1; shift ;;
     --dry-run)    DRY_RUN=1; shift ;;
@@ -140,10 +159,46 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+[ -n "$PREFIX" ] || die "--prefix needs a value"
+[ -n "$INSTALL_ROOT" ] || die "--install-dir needs a value"
+[ -n "$RELEASE_VERSION" ] || die "--version needs a value"
+[ -n "$REPOSITORY" ] || die "--repository needs a value"
+[ -z "$LOCAL_ARCHIVE" ] || [ -f "$LOCAL_ARCHIVE" ] || die "no such release archive: $LOCAL_ARCHIVE"
+
+case "$PREFIX" in
+  /*) ;;
+  *) PREFIX="$PWD/$PREFIX" ;;
+esac
+case "$INSTALL_ROOT" in
+  /*) ;;
+  *) INSTALL_ROOT="$PWD/$INSTALL_ROOT" ;;
+esac
+[ "$PREFIX" != "/" ] || die "refusing to use / as --prefix"
+[ "$INSTALL_ROOT" != "/" ] || die "refusing to use / as --install-dir"
+
+if [ "$RELEASE_VERSION" = "latest" ]; then
+  RELEASE_TAG="latest"
+elif printf '%s\n' "$RELEASE_VERSION" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+  RELEASE_TAG="v${RELEASE_VERSION#v}"
+else
+  die "invalid release version: $RELEASE_VERSION (expected latest or vMAJOR.MINOR.PATCH)"
+fi
+
+printf '%s\n' "$REPOSITORY" | grep -Eq '^[0-9A-Za-z_.-]+/[0-9A-Za-z_.-]+$' || \
+  die "invalid repository: $REPOSITORY (expected OWNER/REPO)"
+
 case "$(uname -s)" in
-  Linux|Darwin) ;;
+  Linux)  PLATFORM="linux" ;;
+  Darwin) PLATFORM="darwin" ;;
   *) die "unsupported platform: $(uname -s). tui-driver drives tmux; use WSL on Windows." ;;
 esac
+case "$(uname -m)" in
+  x86_64|amd64) ARCH="x64" ;;
+  arm64|aarch64) ARCH="arm64" ;;
+  *) die "unsupported architecture: $(uname -m)" ;;
+esac
+
+ASSET="tui-driver-$PLATFORM-$ARCH.tar.gz"
 
 # ── the agent table ──────────────────────────────────────────────────────────
 #
@@ -256,60 +311,183 @@ known_agent() {
   return 1
 }
 
-# ── locating the source checkout ─────────────────────────────────────────────
+# ── release package ──────────────────────────────────────────────────────────
 
-is_checkout() {
-  [ -f "$1/bin/tui.ts" ] && [ -f "$1/skills/$SKILL_NAME/SKILL.md" ] && [ -f "$1/package.json" ]
-}
-
-default_src_dir() {
-  echo "${XDG_DATA_HOME:-$HOME/.local/share}/tui-driver"
-}
-
-resolve_source() {
-  local self script_dir
-  # Empty when piped through `curl | bash`, which is exactly when we must clone.
-  self="${BASH_SOURCE[0]:-}"
-  if [ -n "$self" ] && [ -f "$self" ]; then
-    script_dir="$(cd "$(dirname "$self")" && pwd)"
-    if is_checkout "$script_dir" && [ -z "$GIT_REF" ] && [ -z "$SRC_DIR_ARG" ]; then
-      SRC="$script_dir"
-      SRC_MODE="local"
-      return
-    fi
-  fi
-  SRC="${SRC_DIR_ARG:-$(default_src_dir)}"
-  SRC_MODE="clone"
-}
-
-clone_or_update() {
-  have git || die "git is required to fetch the source (or run install.sh from a checkout)"
-
-  if [ -d "$SRC/.git" ]; then
-    step "Updating $SRC"
-    act git -C "$SRC" fetch --quiet --tags origin
-    if [ -n "$GIT_REF" ]; then
-      act git -C "$SRC" checkout --quiet "$GIT_REF"
-      act git -C "$SRC" pull --quiet --ff-only origin "$GIT_REF" 2>/dev/null || true
-    else
-      act git -C "$SRC" pull --quiet --ff-only
-    fi
-    did "updated"
-    return
-  fi
-
-  if [ -e "$SRC" ] && ! is_checkout "$SRC"; then
-    die "$SRC exists and is not a tui-driver checkout"
-  fi
-
-  step "Cloning $REPO_URL"
-  act mkdir -p "$(dirname "$SRC")"
-  if [ -n "$GIT_REF" ]; then
-    act git clone --quiet --depth 1 --branch "$GIT_REF" "$REPO_URL" "$SRC"
+release_url() {
+  if [ "$RELEASE_TAG" = "latest" ]; then
+    printf '%s/latest/download/%s' "$RELEASE_BASE" "$ASSET"
   else
-    act git clone --quiet --depth 1 "$REPO_URL" "$SRC"
+    printf '%s/download/%s/%s' "$RELEASE_BASE" "$RELEASE_TAG" "$ASSET"
   fi
-  did "cloned into $SRC"
+}
+
+sha256_file() {
+  if have sha256sum; then
+    sha256sum "$1" | awk '{print $1}'
+  elif have shasum; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    die "sha256sum or shasum is required to verify the release"
+  fi
+}
+
+verify_checksum() {
+  local archive="$1" checksum="$2" expected actual
+  expected="$(awk 'NR == 1 { print $1 }' "$checksum")"
+  case "$expected" in
+    *[!0-9a-fA-F]*|'') die "invalid checksum file: $checksum" ;;
+  esac
+  [ "${#expected}" -eq 64 ] || die "invalid checksum file: $checksum"
+  actual="$(sha256_file "$archive")"
+  [ "$actual" = "$expected" ] || die "checksum mismatch for $archive"
+  ok "SHA-256 verified"
+}
+
+validate_archive() {
+  local archive="$1" entry saw_bin=0 saw_skill=0 saw_meta=0
+  while IFS= read -r entry; do
+    case "$entry" in
+      tui-driver|tui-driver/*) ;;
+      *) die "release archive contains an unsafe path: $entry" ;;
+    esac
+    case "/$entry/" in
+      */../*|*/./*) die "release archive contains an unsafe path: $entry" ;;
+    esac
+    case "$entry" in
+      tui-driver/bin/tui) saw_bin=1 ;;
+      tui-driver/skills/tui-driver/SKILL.md) saw_skill=1 ;;
+      tui-driver/release.json) saw_meta=1 ;;
+    esac
+  done < <(tar -tzf "$archive")
+  [ "$saw_bin" -eq 1 ] && [ "$saw_skill" -eq 1 ] && [ "$saw_meta" -eq 1 ] || \
+    die "release archive is missing the executable, skill, or metadata"
+  if tar -tvzf "$archive" | awk 'substr($1, 1, 1) == "l" || substr($1, 1, 1) == "h" { found=1 } END { exit !found }'; then
+    die "release archive contains a symbolic or hard link"
+  fi
+}
+
+json_string() {
+  sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$2" | head -n 1
+}
+
+acquire_install_lock() {
+  [ "$DRY_RUN" -eq 0 ] || return
+  mkdir -p "$INSTALL_ROOT"
+  LOCK_DIR="$INSTALL_ROOT/.install.lock"
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    die "another install is using $INSTALL_ROOT (remove $LOCK_DIR if it is stale)"
+  fi
+}
+
+release_install_lock() {
+  if [ -n "$LOCK_DIR" ] && [ -d "$LOCK_DIR" ]; then rmdir "$LOCK_DIR"; fi
+  LOCK_DIR=""
+}
+
+fetch_release() {
+  local url archive checksum extracted version metadata_platform metadata_arch version_dir staged
+  TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/tui-driver-install.XXXXXX")"
+  archive="$TMP_ROOT/$ASSET"
+  checksum="$archive.sha256"
+
+  step "Fetching tui-driver release"
+  if [ -n "$LOCAL_ARCHIVE" ]; then
+    [ -f "$LOCAL_ARCHIVE" ] || die "no such release archive: $LOCAL_ARCHIVE"
+    [ -f "$LOCAL_ARCHIVE.sha256" ] || die "missing checksum: $LOCAL_ARCHIVE.sha256"
+    cp "$LOCAL_ARCHIVE" "$archive"
+    cp "$LOCAL_ARCHIVE.sha256" "$checksum"
+    info "archive: $LOCAL_ARCHIVE"
+  else
+    have curl || die "curl is required to download the release"
+    url="$(release_url)"
+    curl -fL --retry 3 --proto '=https' --tlsv1.2 -o "$archive" "$url"
+    curl -fL --retry 3 --proto '=https' --tlsv1.2 -o "$checksum" "$url.sha256"
+    info "release: ${RELEASE_TAG} ($PLATFORM/$ARCH)"
+  fi
+
+  verify_checksum "$archive" "$checksum"
+  validate_archive "$archive"
+  tar -xzf "$archive" -C "$TMP_ROOT"
+  extracted="$TMP_ROOT/tui-driver"
+  version="$(json_string version "$extracted/release.json")"
+  metadata_platform="$(json_string platform "$extracted/release.json")"
+  metadata_arch="$(json_string arch "$extracted/release.json")"
+  [ -n "$version" ] || die "release metadata has no version"
+  printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' || \
+    die "release metadata has an invalid version: $version"
+  [ "$metadata_platform" = "$PLATFORM" ] || die "release is for $metadata_platform, expected $PLATFORM"
+  [ "$metadata_arch" = "$ARCH" ] || die "release is for $metadata_arch, expected $ARCH"
+  if [ "$RELEASE_TAG" != "latest" ] && [ "$RELEASE_TAG" != "v$version" ]; then
+    die "release metadata version $version does not match requested $RELEASE_TAG"
+  fi
+  [ -x "$extracted/bin/tui" ] || die "release executable is not executable"
+
+  if [ -e "$INSTALL_ROOT" ] && [ ! -f "$INSTALL_ROOT/$ROOT_MARKER" ] && \
+     [ ! -d "$INSTALL_ROOT/.git" ] && [ -n "$(ls -A "$INSTALL_ROOT" 2>/dev/null)" ] && \
+     [ "$FORCE" -eq 0 ]; then
+    die "$INSTALL_ROOT exists and is not managed by this installer (use --force or --install-dir)"
+  fi
+
+  acquire_install_lock
+  version_dir="$INSTALL_ROOT/releases/$version"
+  step "Installing release $version"
+  mkdir -p "$INSTALL_ROOT/releases"
+  printf '%s\n' "$MARKER" > "$INSTALL_ROOT/$ROOT_MARKER"
+  if [ -e "$version_dir" ]; then
+    if [ -x "$version_dir/bin/tui" ] && [ "$(json_string version "$version_dir/release.json")" = "$version" ]; then
+      skip "$version_dir (already installed)"
+    elif [ "$FORCE" -eq 1 ]; then
+      rm -rf "$version_dir"
+      mv "$extracted" "$version_dir"
+      did "$version_dir"
+    else
+      die "$version_dir exists but is not a valid tui-driver release (use --force)"
+    fi
+  else
+    staged="$INSTALL_ROOT/releases/.${version}.new.$$"
+    mv "$extracted" "$staged"
+    mv "$staged" "$version_dir"
+    did "$version_dir"
+  fi
+
+  ln -sfn "$version_dir" "$INSTALL_ROOT/.current.new.$$"
+  mv -f "$INSTALL_ROOT/.current.new.$$" "$INSTALL_ROOT/current"
+  SRC="$INSTALL_ROOT/current"
+  ok "current → $version"
+}
+
+plan_release() {
+  SRC="$INSTALL_ROOT/current"
+  step "Fetching tui-driver release"
+  if [ -n "$LOCAL_ARCHIVE" ]; then
+    info "would: verify and unpack $LOCAL_ARCHIVE"
+  else
+    info "would: download $(release_url)"
+    info "would: verify $(release_url).sha256"
+  fi
+  info "would: install under $INSTALL_ROOT/releases and update $INSTALL_ROOT/current"
+}
+
+uninstall_release() {
+  step "Removing installed releases"
+  if [ -f "$INSTALL_ROOT/$ROOT_MARKER" ]; then
+    acquire_install_lock
+    act rm -rf "$INSTALL_ROOT/releases"
+    act rm -f "$INSTALL_ROOT/current" "$INSTALL_ROOT/$ROOT_MARKER"
+    if [ -d "$INSTALL_ROOT/.git" ]; then
+      did "removed release files; legacy checkout left at $INSTALL_ROOT"
+    else
+      if [ "$DRY_RUN" -eq 0 ]; then
+        release_install_lock
+        rmdir "$INSTALL_ROOT" 2>/dev/null || true
+      fi
+      did "removed releases from $INSTALL_ROOT"
+    fi
+  elif [ -e "$INSTALL_ROOT" ]; then
+    warn "$INSTALL_ROOT is not marked as a release install — left alone"
+  else
+    skip "$INSTALL_ROOT (not present)"
+  fi
 }
 
 # ── dependency checks ────────────────────────────────────────────────────────
@@ -343,20 +521,7 @@ digits() {
 check_deps() {
   step "Checking dependencies"
 
-  local v tv
-  if have bun; then
-    v="$(bun --version 2>/dev/null | tr -d '[:space:]')"
-    if version_at_least "$v" "$MIN_BUN"; then
-      ok "bun $v"
-    else
-      warn "bun $v is older than the required $MIN_BUN — upgrade with: bun upgrade"
-    fi
-  else
-    BUN_MISSING=1
-    warn "bun is not installed. tui-driver runs on bun; install it with:"
-    info "      curl -fsSL https://bun.sh/install | bash"
-  fi
-
+  local tv
   if have tmux; then
     tv="$(tmux -V 2>/dev/null | sed 's/^tmux //')"
     if version_at_least "$(printf '%s' "$tv" | sed 's/[^0-9.].*$//')" "$MIN_TMUX"; then
@@ -382,10 +547,10 @@ check_deps() {
   fi
 }
 
-# ── the CLI shim ─────────────────────────────────────────────────────────────
+# ── the CLI links ────────────────────────────────────────────────────────────
 
 is_our_file() {
-  [ -f "$1" ] && grep -q "$MARKER" "$1" 2>/dev/null
+  [ -f "$1" ] && [ ! -L "$1" ] && grep -q "$MARKER" "$1" 2>/dev/null
 }
 
 is_our_dir() {
@@ -395,46 +560,28 @@ is_our_dir() {
 install_bin() {
   step "Installing the CLI into $PREFIX"
 
-  local shim="$PREFIX/tui" alt="$PREFIX/tui-driver" bun_path tmp
-  bun_path="$(command -v bun 2>/dev/null || true)"
+  local shim="$PREFIX/tui" alt="$PREFIX/tui-driver" executable="$INSTALL_ROOT/current/bin/tui"
 
-  if [ -e "$shim" ] && ! is_our_file "$shim" && [ "$FORCE" -eq 0 ]; then
+  if [ -L "$shim" ] && [ "$(readlink "$shim")" = "$executable" ]; then
+    ok "$shim ${DIM}(already linked)${R}"
+  elif { [ -e "$shim" ] || [ -L "$shim" ]; } && ! is_our_file "$shim" && [ "$FORCE" -eq 0 ]; then
     warn "$shim exists and was not written by this installer — skipping (use --force)"
     return
+  else
+    act mkdir -p "$PREFIX"
+    act rm -f "$shim"
+    act ln -s "$executable" "$shim"
+    did "$shim → $executable"
   fi
 
-  if [ "$DRY_RUN" -eq 1 ]; then
-    info "${DIM}would: write $shim${R}"
-    info "${DIM}would: link  $alt -> tui${R}"
-    return
-  fi
-
-  mkdir -p "$PREFIX"
-  tmp="$(mktemp "$PREFIX/.tui.XXXXXX")"
-  cat >"$tmp" <<EOF
-#!/bin/sh
-# $MARKER — generated file, edits will be overwritten.
-TUI_DRIVER_SRC="$SRC"
-if command -v bun >/dev/null 2>&1; then
-  exec bun "\$TUI_DRIVER_SRC/bin/tui.ts" "\$@"
-fi
-# PATH is often thinner when an editor or agent spawns us, so fall back to
-# wherever bun lived at install time before giving up.
-if [ -x "$bun_path" ]; then
-  exec "$bun_path" "\$TUI_DRIVER_SRC/bin/tui.ts" "\$@"
-fi
-echo "tui-driver: bun not found on PATH. Install it: curl -fsSL https://bun.sh/install | bash" >&2
-exit 3
-EOF
-  chmod 755 "$tmp"
-  mv -f "$tmp" "$shim"
-  ok "$shim"
-
-  if [ -e "$alt" ] && [ ! -L "$alt" ] && ! is_our_file "$alt" && [ "$FORCE" -eq 0 ]; then
+  if [ -L "$alt" ] && [ "$(readlink "$alt")" = "tui" ]; then
+    ok "$alt ${DIM}(already linked)${R}"
+  elif { [ -e "$alt" ] || [ -L "$alt" ]; } && ! is_our_file "$alt" && [ "$FORCE" -eq 0 ]; then
     warn "$alt exists and was not written by this installer — skipping (use --force)"
   else
-    ln -sfn "tui" "$alt"
-    ok "$alt → tui"
+    act rm -f "$alt"
+    act ln -s "tui" "$alt"
+    did "$alt → tui"
   fi
 
   case ":${PATH}:" in
@@ -447,9 +594,12 @@ uninstall_bin() {
   step "Removing the CLI from $PREFIX"
   local shim="$PREFIX/tui" alt="$PREFIX/tui-driver"
 
-  if is_our_file "$shim"; then
+  if [ -L "$shim" ] && [ "$(readlink "$shim")" = "$INSTALL_ROOT/current/bin/tui" ]; then
     act rm -f "$shim"; did "removed $shim"
-  elif [ -e "$shim" ]; then
+  elif is_our_file "$shim"; then
+    # Migrate/uninstall the source-checkout shim written by installer versions <= 0.1.0.
+    act rm -f "$shim"; did "removed $shim"
+  elif [ -e "$shim" ] || [ -L "$shim" ]; then
     warn "$shim was not written by this installer — left alone"
   else
     skip "$shim (not present)"
@@ -457,7 +607,7 @@ uninstall_bin() {
 
   if [ -L "$alt" ] && [ "$(readlink "$alt")" = "tui" ]; then
     act rm -f "$alt"; did "removed $alt"
-  elif [ -e "$alt" ]; then
+  elif [ -e "$alt" ] || [ -L "$alt" ]; then
     warn "$alt was not written by this installer — left alone"
   else
     skip "$alt (not present)"
@@ -603,22 +753,23 @@ select_agents() {
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
-BUN_MISSING=0
 TMUX_MISSING=0
 PATH_HINT=""
 NO_AGENT_DETECTED=0
-SRC=""
-SRC_MODE=""
+SRC="$INSTALL_ROOT/current"
+TMP_ROOT=""
+
+cleanup() {
+  if [ -n "$LOCK_DIR" ] && [ -d "$LOCK_DIR" ]; then rmdir "$LOCK_DIR" 2>/dev/null || true; fi
+  if [ -n "$TMP_ROOT" ] && [ -d "$TMP_ROOT" ]; then rm -rf "$TMP_ROOT"; fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if [ -n "$PROJECT_DIR" ]; then
   [ -d "$PROJECT_DIR" ] || die "no such directory: $PROJECT_DIR"
   PROJECT_DIR="$(cd "$PROJECT_DIR" && pwd)"
-fi
-
-resolve_source
-
-if [ "$UNINSTALL" -eq 0 ] && [ "$SRC_MODE" = "clone" ]; then
-  clone_or_update
 fi
 
 say ""
@@ -626,9 +777,9 @@ if [ "$UNINSTALL" -eq 1 ]; then
   step "Uninstalling tui-driver"
 else
   step "Installing tui-driver"
-  if ! is_checkout "$SRC"; then die "$SRC is not a tui-driver checkout"; fi
 fi
-info "source:  $SRC"
+info "release: $RELEASE_TAG ($PLATFORM/$ARCH)"
+info "install: $INSTALL_ROOT"
 if [ -n "$PROJECT_DIR" ]; then info "project: $PROJECT_DIR"; fi
 if [ "$DRY_RUN" -eq 1 ]; then info "${DIM}dry run — nothing will be written${R}"; fi
 say ""
@@ -648,10 +799,17 @@ if [ "$UNINSTALL" -eq 1 ]; then
     done
     say ""
   fi
-  say "The checkout at $SRC was left in place; delete it yourself if you want it gone."
+  uninstall_release
   say ""
   exit 0
 fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  plan_release
+else
+  fetch_release
+fi
+say ""
 
 check_deps
 say ""
@@ -696,12 +854,11 @@ if [ -n "$PATH_HINT" ]; then
     *)    info "      echo 'export PATH=\"$PATH_HINT:\$PATH\"' >> ~/.bashrc && exec bash" ;;
   esac
 fi
-if [ "$BUN_MISSING" -eq 1 ];  then warn "install bun before running tui"; fi
 if [ "$TMUX_MISSING" -eq 1 ]; then warn "install tmux before running tui"; fi
 
 say ""
 info "Verify:   tui doctor"
 info "Try it:   tui start --name htop -- htop && tui snap htop && tui stop htop"
-info "Update:   git -C $SRC pull        ${DIM}(symlinked skills follow; --copy ones do not)${R}"
-info "Remove:   $SRC/install.sh --uninstall"
+info "Update:   rerun the latest release installer ${DIM}(--copy skills must be recopied)${R}"
+info "Remove:   $INSTALL_ROOT/current/install.sh --uninstall"
 say ""
