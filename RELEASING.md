@@ -42,7 +42,9 @@ the Bun JIT entitlements. There is currently no Apple Developer ID signing or no
 ## Verify after publication
 
 Inspect the workflow and the release page, then test both the moving and pinned installer URLs on
-at least one Linux and one macOS machine:
+at least one Linux and one macOS machine. The workflow performs these checks in temporary directories
+after publication, including `tui --version` and `tui doctor`; prereleases only test their pinned URL.
+To verify an installation yourself:
 
 ```bash
 curl -fsSL https://github.com/evandrocabf/tui-driver/releases/latest/download/install.sh | bash
@@ -57,3 +59,13 @@ Do not create a release manually before the build jobs finish. The workflow crea
 the four archives and their smoke tests are complete. It uploads into a draft first and publishes
 the release only after every asset is attached. Tags with a prerelease suffix create a GitHub
 prerelease and do not replace the stable `latest` installer target.
+
+If a workflow fix is needed after a tag was pushed, merge the fix to `main` and dispatch the current
+workflow with the existing tag instead of moving it:
+
+```bash
+gh workflow run release.yml --ref main -f tag=v0.1.0
+```
+
+The dispatched workflow validates the annotated tag and its ancestry on `main`, then builds and
+publishes from that exact tagged commit. Use this recovery path before a release has been created.
