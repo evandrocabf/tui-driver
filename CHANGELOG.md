@@ -6,10 +6,16 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-Nothing is published to a registry yet — `package.json` carries `"private": true`. Install from the
-repository with `install.sh`.
+## [0.1.0] - 2026-09-04
+
+Nothing is published to a package registry — `package.json` carries `"private": true`. Tagged
+GitHub releases provide standalone executables and a checksum-verifying installer.
 
 ### Added
+
+- **Tagged standalone releases.** Native Linux and macOS archives for x64 and arm64 are built and
+  smoke-tested on their matching GitHub-hosted runners. The installer downloads a release asset,
+  verifies SHA-256, switches versions atomically, and no longer clones source or requires Bun.
 
 - **Complete pane-state contracts.** Snapshots and frames now carry `schemaVersion`, `stateHash` and
   a styled cell grid. Waits, recorders, diffs and scenario goldens can observe cursor, dimensions,
@@ -48,7 +54,7 @@ repository with `install.sh`.
 - **An agent skill.** `skills/tui-driver/SKILL.md` is written for any coding agent that can run a
   shell command, with no vendor-specific tool names in it. `install.sh` places it wherever the agents
   on the machine look — Claude Code, Codex, Cursor, opencode, Gemini, Cline, Windsurf, and the
-  shared `~/.agents/skills` location — alongside a `tui` shim on `PATH`.
+  shared `~/.agents/skills` location — alongside `tui` on `PATH`.
 - **Diagnostics.** `tui doctor` checks tmux, terminfo and image rendering. A missing rasterizer is a
   warning; only tmux and terminfo affect the exit code.
 - Documented exit codes: `0` success, `1` condition not met, `2` usage error, `3` missing dependency,
@@ -56,4 +62,5 @@ repository with `install.sh`.
 - Continuous integration on Linux and macOS, with lint, formatting, type checks, and a line-coverage
   floor of 98% over shipped code.
 
-[Unreleased]: https://github.com/evandrocabf/tui-driver/commits/main
+[Unreleased]: https://github.com/evandrocabf/tui-driver/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/evandrocabf/tui-driver/releases/tag/v0.1.0

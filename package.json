@@ -48,6 +48,7 @@
   ],
   "scripts": {
     "tui": "bun run bin/tui.ts",
+    "build:release": "bun run scripts/build-release.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",

@@ -26,7 +26,6 @@ video on the selected row, and the mouse event the app received are all real.
 
 - **`tmux` ≥ 3.2.** That is what `new-session -e` needs; `capture-pane -N` needs 3.1 and
   `resize-window` needs 2.9. Verified on 3.5a and 3.6a.
-- **`bun` ≥ 1.3.11.**
 - **Linux or macOS.** Windows is not supported natively — the tool is a tmux driver. WSL is fine.
 - Optional, for PNG output: `rsvg-convert` (`librsvg2-bin` on Debian/Ubuntu, `librsvg2-tools` on
   Fedora, `brew install librsvg` on macOS) **or** ImageMagick **or** Chrome.
@@ -34,6 +33,9 @@ video on the selected row, and the mouse event the app received are all real.
   warning rather than a failure.
 
 Run `tui doctor` to check all of this at once.
+
+The release executable is standalone. Bun ≥ 1.3.11 is needed only to build or run the TypeScript
+source from a checkout.
 
 The managed scope is one tmux pane containing a character-cell TUI. Sixel, Kitty graphics and iTerm
 images are not represented by tmux's cell capture, and a private PTY cannot prove behavior that
@@ -43,45 +45,53 @@ with the live keyboard, mouse and capture modes.
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/evandrocabf/tui-driver/main/install.sh | bash
+curl -fsSL https://github.com/evandrocabf/tui-driver/releases/latest/download/install.sh | bash
 ```
 
-That puts `tui` and `tui-driver` on your PATH and installs the skill into every coding agent it
-finds. It writes nothing you did not ask for, prints every path as it goes, and is undone by
-`install.sh --uninstall`.
+The installer selects the Linux or macOS asset for the current CPU, verifies its SHA-256 checksum,
+and switches a versioned `current` link only after the package is complete. It puts `tui` and
+`tui-driver` on your PATH and installs the skill into every coding agent it finds. It does not clone
+the repository and does not require Bun.
 
-From a checkout, run it directly — it installs from where it stands rather than cloning:
+Pin an exact release when reproducibility matters:
+
+```bash
+curl -fsSL https://github.com/evandrocabf/tui-driver/releases/download/v0.1.0/install.sh \
+  | bash -s -- --version v0.1.0
+```
+
+| Option                                  |                                                                     |
+| --------------------------------------- | ------------------------------------------------------------------- |
+| `--version v0.1.0`                      | install an exact release instead of `latest`                        |
+| `--agents claude,codex`                 | pick agents instead of auto-detecting                               |
+| `--all`                                 | install for every supported agent, detected or not                  |
+| `--project [DIR]`                       | install into a project's `.claude/skills/…` instead of `$HOME`      |
+| `--no-agents` / `--no-bin`              | just the CLI / just the skill                                       |
+| `--prefix DIR`                          | where the CLI links go (default `~/.local/bin`)                     |
+| `--install-dir DIR`                     | where versioned releases live (default `~/.local/share/tui-driver`) |
+| `--repository OWNER/REPO`               | download releases from a fork                                       |
+| `--archive FILE`                        | install a local archive after verifying `FILE.sha256`               |
+| `--copy`                                | copy the skill instead of symlinking it                             |
+| `--dry-run` / `--uninstall` / `--force` |                                                                     |
+
+Run the latest installer again to update. The CLI and symlinked skills switch together; skills
+installed with `--copy` are recopied only when that agent is included in the update. Remove the
+installation with `~/.local/share/tui-driver/current/install.sh --uninstall --all`.
+
+If an older installer cloned the repository into that data directory, the new installer preserves
+the checkout, stops using it, and installs releases beside it. Uninstalling also leaves that legacy
+checkout for you to remove deliberately.
+
+For development from a checkout:
 
 ```bash
 git clone https://github.com/evandrocabf/tui-driver.git && cd tui-driver
-./install.sh --dry-run     # see the plan first
-./install.sh
+bun install
+bun link
 ```
 
-| Option                                  |                                                                |
-| --------------------------------------- | -------------------------------------------------------------- |
-| `--agents claude,codex`                 | pick agents instead of auto-detecting                          |
-| `--all`                                 | install for every supported agent, detected or not             |
-| `--project [DIR]`                       | install into a project's `.claude/skills/…` instead of `$HOME` |
-| `--no-agents` / `--no-bin`              | just the CLI / just the skill                                  |
-| `--prefix DIR`                          | where the CLI shim goes (default `~/.local/bin`)               |
-| `--dir DIR`                             | where to clone (default `~/.local/share/tui-driver`)           |
-| `--ref REF` / `--repo URL`              | install a specific tag, branch or fork                         |
-| `--copy`                                | copy the skill instead of symlinking it                        |
-| `--dry-run` / `--uninstall` / `--force` |                                                                |
-
-The CLI is installed as a three-line shim that execs `bun` on the checkout, so **`git pull` is the
-whole update story** — symlinked skills follow the checkout automatically. `--copy` installs do not,
-by design.
-
-Prefer to do it by hand? Nothing here needs an installer:
-
-```bash
-bun install     # dev tooling only; the CLI itself has zero runtime dependencies
-bun link        # puts `tui` and `tui-driver` on your PATH (undo with `bun unlink`)
-```
-
-Agents can also just call the CLI directly: `bun run /path/to/tui-driver/bin/tui.ts <command>`.
+`bun link` exposes live source edits on PATH and `bun unlink` reverses it. Agents can also call
+`bun run /path/to/tui-driver/bin/tui.ts <command>` directly.
 
 ## Agent integration
 
@@ -91,7 +101,8 @@ tool-calling convention to match — `tui snap app` is a command that prints tex
 agent on the market can already do. Anything an agent can learn from a `SKILL.md`, it can drive.
 
 The instructions live in **one** file, versioned with the tool: `skills/tui-driver/SKILL.md`. Every
-agent below reads that same file — nothing to keep in sync, and `install.sh` only ever links to it.
+agent below reads that same file from the active release, so the executable and instructions switch
+versions together.
 
 | Agent                    | Installed to                            | Loading   | How it fires                |
 | ------------------------ | --------------------------------------- | --------- | --------------------------- |
@@ -486,7 +497,8 @@ bun run test:coverage     # what CI gates on
 bun run format
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the layout of the code and the conventions.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the code conventions and [RELEASING.md](RELEASING.md) for
+the tag and release process.
 
 `tests/fixtures/menu.py` is a small curses app used by the integration tests and the example
 scenario — it needs at least 58x12 to draw, and aborts below that. `tests/fixtures/mouse-echo.sh`

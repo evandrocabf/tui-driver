@@ -9,15 +9,15 @@ keeps working on someone else's machine.
 bun install          # dev tooling only — the CLI itself has zero runtime dependencies
 bun run typecheck
 bun test tests
-./install.sh         # optional: `tui` on your PATH + the skill in your agents (--dry-run first)
+bun link             # optional: expose live checkout edits as `tui` on PATH
 ```
 
 You need `tmux` ≥ 3.2 and `python3` for the integration tests. Without them those tests skip
 themselves, so a green local run does not necessarily mean much — CI runs them on Linux and macOS.
 
 `bun run bin/tui.ts <command>` works without installing anything. `tui doctor` checks your
-environment. `./install.sh` symlinks to your checkout rather than copying it, so your edits are live
-in every agent immediately; `./install.sh --uninstall` reverses it.
+environment. The public `install.sh` path installs a compiled GitHub release; use `bun link` and
+`bun unlink` while developing against a checkout.
 
 ## Lint, format, types
 
@@ -69,7 +69,8 @@ with `TUI_DRIVER_HOME` — that is what the tests do.
 
 - **Strict TypeScript.** `noUncheckedIndexedAccess` is on; if the compiler makes you check an index,
   check it rather than asserting.
-- **No runtime dependencies.** Adding one needs a good reason. Everything currently ships as source.
+- **No runtime dependencies.** Adding one needs a good reason. Releases embed Bun in a standalone
+  executable, while tmux and optional PNG rasterizers remain system tools.
 - **Errors carry exit codes.** Throw the class from `src/errors.ts` that matches the meaning
   (`UsageError` → 2, `DependencyError` → 3, `SessionError` → 4, `ConditionError` → 1) instead of a
   bare `Error`. The exit codes are a documented contract that agents branch on.
@@ -94,7 +95,7 @@ The demo fixture `tests/fixtures/menu.py` needs a terminal of at least 58x12. An
 curses aborts, the pane dies, and the failure looks like a bug in the harness. Use the exported
 `FIXTURE_COLS`/`FIXTURE_ROWS`.
 
-Coverage is gated by `scripts/check-coverage.ts` at 99% of lines. It reads the lcov report, because
+Coverage is gated by `scripts/check-coverage.ts` at 98% of lines. It reads the lcov report, because
 bunfig's own `coverageThreshold` is reported but does not affect `bun test`'s exit code.
 
 The last fraction of a percent is deliberate. What remains uncovered needs a broken environment to

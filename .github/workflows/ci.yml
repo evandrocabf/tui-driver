@@ -12,12 +12,18 @@ concurrency:
 
 jobs:
   test:
-    name: test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: test (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - runner: ubuntu-24.04
+            release-target: bun-linux-x64-baseline
+            release-asset: linux-x64
+          - runner: macos-15
+            release-target: bun-darwin-arm64
+            release-asset: darwin-arm64
 
     steps:
       - uses: actions/checkout@v4
@@ -57,8 +63,10 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           bash -n install.sh
+          bash -n scripts/test-release-install.sh
+          bash -n scripts/smoke-release.sh
           bash -n tests/fixtures/mouse-echo.sh
-          shellcheck --severity=warning install.sh tests/fixtures/mouse-echo.sh
+          shellcheck --severity=warning install.sh scripts/test-release-install.sh scripts/smoke-release.sh tests/fixtures/mouse-echo.sh
 
       - run: bun install --frozen-lockfile
 
@@ -71,3 +79,13 @@ jobs:
       # Also the backstop for silently skipped integration tests: if they do not
       # run, coverage drops far below the floor and this step fails.
       - run: bun run test:coverage
+
+      # Keep the install path exercised on ordinary pull requests. The tag workflow repeats this
+      # natively for all four release architectures before it publishes anything.
+      - name: Smoke-test the release package
+        run: |
+          bun run build:release --target "${{ matrix.release-target }}"
+          mkdir release-smoke
+          tar -xzf "dist/tui-driver-${{ matrix.release-asset }}.tar.gz" -C release-smoke
+          scripts/smoke-release.sh release-smoke/tui-driver/bin/tui
+          scripts/test-release-install.sh "dist/tui-driver-${{ matrix.release-asset }}.tar.gz"
