@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 import { main } from "../../src/cli.js";
 import { setDeadline } from "../../src/lifetime.js";
+import { readWatcher } from "../../src/watch.js";
 import {
   captureOutput,
   createState,
@@ -106,6 +107,7 @@ describe.skipIf(!TOOLS_AVAILABLE)("cli commands", () => {
       const { result, stdout } = await run(["doctor"]);
       expect(result).toBe(0);
       expect(stdout).toContain("tmux");
+      expect(stdout).toContain("tmux canary");
       expect(stdout).toContain("terminfo");
       expect(stdout).toContain("state directory");
     });
@@ -122,6 +124,7 @@ describe.skipIf(!TOOLS_AVAILABLE)("cli commands", () => {
          still pass a CI run that never asks for an image. */
       expect(report.checks.find((c) => c.name === "image rendering")?.required).toBe(false);
       expect(report.checks.find((c) => c.name === "tmux")?.required).toBe(true);
+      expect(report.checks.find((c) => c.name === "tmux canary")?.required).toBe(true);
     });
   });
 
@@ -157,6 +160,16 @@ describe.skipIf(!TOOLS_AVAILABLE)("cli commands", () => {
       await run(["stop", "clean-all-1"]);
       const { result } = await run(["clean", "--all"]);
       expect(result).toBe(0);
+    }, 30_000);
+
+    test("clean stops an active recorder before removing its state", async () => {
+      const name = await startFixture("clean-watcher");
+      await run(["watch", name, "--interval", "100ms"]);
+      expect(await readWatcher(name)).toBeDefined();
+      expect((await run(["clean", name])).result).toBe(0);
+      expect(await readWatcher(name)).toBeUndefined();
+      expect((await run(["snap", name, "--no-save"])).result).toBe(0);
+      await run(["stop", name, "--purge"]);
     }, 30_000);
   });
 
@@ -445,7 +458,8 @@ describe.skipIf(!TOOLS_AVAILABLE)("cli commands", () => {
 
     test("--status --json describes the running recorder", async () => {
       const name = await startFixture("watch-json");
-      await run(["watch", name, "--interval", "300ms"]);
+      const started = await run(["watch", name, "--interval", "300ms", "--json"]);
+      expect((JSON.parse(started.stdout) as { session: string }).session).toBe(name);
       const { result, stdout } = await run(["watch", name, "--status", "--json"]);
       expect(result).toBe(0);
       const state = JSON.parse(stdout) as { pid: number; session: string };
@@ -638,12 +652,12 @@ steps:
       await run(["stop", name]);
     }, 40_000);
 
-    test("clicking a TUI that never enabled the mouse warns rather than failing", async () => {
-      /* The bytes are delivered either way; the warning is what stops it looking like a no-op. */
+    test("clicking a TUI that never enabled the mouse fails before delivery unless forced", async () => {
       await run(["start", "--name", "mouse-off", "--shell", "sleep 30"]);
       const { result, stderr } = await run(["click", "mouse-off", "1", "1"]);
-      expect(result).toBe(0);
+      expect(result).toBe(1);
       expect(stderr).toContain("has not enabled mouse reporting");
+      expect((await run(["click", "mouse-off", "1", "1", "--force"])).result).toBe(0);
       await run(["stop", "mouse-off"]);
     }, 30_000);
 
@@ -655,7 +669,7 @@ steps:
       await run(["stop", name]);
     }, 30_000);
 
-    test("--wait-text that never matches warns but still starts the session", async () => {
+    test("--wait-text that never matches leaves the session inspectable but exits 1", async () => {
       const { result, stderr } = await run([
         "start",
         "--name",
@@ -667,8 +681,8 @@ steps:
         "--shell",
         "sleep 30",
       ]);
-      expect(result).toBe(0);
-      expect(stderr).toContain("never matched");
+      expect(result).toBe(1);
+      expect(stderr).toContain("condition not met");
       await run(["stop", "wait-text-miss"]);
     }, 30_000);
 

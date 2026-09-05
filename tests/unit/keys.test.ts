@@ -1,7 +1,14 @@
 import { describe, expect, test } from "bun:test";
+import assert from "node:assert/strict";
 
 import { UsageError } from "../../src/errors.js";
-import { normalizeKey } from "../../src/input.js";
+import {
+  kittyKeySequence,
+  mouseClick,
+  normalizeKey,
+  parseMouseEncoding,
+  sendRawBytes,
+} from "../../src/input.js";
 
 describe("normalizeKey", () => {
   test("passes single characters through untouched", () => {
@@ -47,5 +54,52 @@ describe("normalizeKey", () => {
   test("trims surrounding whitespace and rejects an empty key", () => {
     expect(normalizeKey("  Tab  ")).toBe("Tab");
     expect(() => normalizeKey("   ")).toThrow(UsageError);
+  });
+});
+
+describe("exact input protocols", () => {
+  test("encodes Kitty press, repeat and release with modifiers", () => {
+    expect(Buffer.from(kittyKeySequence(65, ["shift", "ctrl"], "repeat")).toString()).toBe(
+      "\u001b[65;6:2u",
+    );
+    expect(Buffer.from(kittyKeySequence(65, [], "release")).toString()).toBe("\u001b[65;1:3u");
+  });
+
+  test("validates key modifiers, code points and mouse encodings", () => {
+    expect(() => kittyKeySequence(-1)).toThrow();
+    expect(() => kittyKeySequence(65, ["banana"])).toThrow();
+    expect(parseMouseEncoding("sgr")).toBe("sgr");
+    expect(() => parseMouseEncoding("guess")).toThrow();
+  });
+
+  test("rejects malformed raw input and mouse gestures before contacting tmux", async () => {
+    await assert.rejects(sendRawBytes("unused", [[]]), /cannot be empty/);
+    await assert.rejects(sendRawBytes("unused", [[256]]), /0 to 255/);
+    await assert.rejects(
+      mouseClick("unused", -1, 0, "left", { ctrl: false, alt: false, shift: false }),
+      /non-negative integers/,
+    );
+    await assert.rejects(
+      mouseClick(
+        "unused",
+        0,
+        0,
+        "left",
+        { ctrl: false, alt: false, shift: false },
+        {
+          count: 0,
+          force: true,
+          modes: {
+            any: false,
+            standard: false,
+            button: false,
+            all: false,
+            sgr: false,
+            utf8: false,
+          },
+        },
+      ),
+      /positive integer/,
+    );
   });
 });

@@ -7,13 +7,14 @@
  * picture of it.
  */
 
+import { open, rm } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { CursorState, Snapshot } from "./capture.js";
 import { UsageError } from "./errors.js";
 import { framesDir, framesIndexPath } from "./paths.js";
 import { renderAnsiToFile, type RenderFormat } from "./render.js";
-import { appendJsonl, ensureDir, readJsonl, stampFor } from "./util.js";
+import { appendJsonl, ensureDir, readJsonl, stampFor, writePrivateFile } from "./util.js";
 
 /** Where a frame came from: the background recorder (`auto`) or an explicit `snap` (`snap`). */
 export type FrameKind = "auto" | "snap";
@@ -26,6 +27,7 @@ export type FrameKind = "auto" | "snap";
  * command.
  */
 export interface FrameRecord {
+  schemaVersion: 1;
   /** Timestamp-based identifier, also the base name of the frame's files. Sorts chronologically. */
   id: string;
   kind: FrameKind;
@@ -37,6 +39,8 @@ export interface FrameRecord {
   elapsedMs: number;
   /** Content hash of the ANSI, which is how the recorder tells a repaint from an idle screen. */
   hash: string;
+  /** Hash of content and observable pane state. */
+  stateHash: string;
   /** Screen width in columns at capture time. */
   cols: number;
   /** Screen height in rows at capture time. */
@@ -53,6 +57,8 @@ export interface FrameRecord {
     text: string;
     /** The screen with ANSI escapes, which is what any later render reads. */
     ansi: string;
+    /** Complete snapshot metadata and styled cell grid. */
+    state?: string;
     /** A rendered image, if one was asked for at capture time. */
     image?: string;
   };
@@ -95,14 +101,26 @@ export function assertLabel(label: string): void {
  * Timestamps have millisecond resolution, so two captures in the same millisecond — or two frames
  * sharing a label — would otherwise overwrite each other's files.
  */
-async function uniqueFrameId(name: string, base: string): Promise<string> {
+async function reserveFrameId(name: string, base: string): Promise<{ id: string; path: string }> {
   let candidate = base;
   let counter = 1;
-  while (await Bun.file(join(framesDir(name), `${candidate}.txt`)).exists()) {
-    candidate = `${base}-${counter}`;
-    counter += 1;
+  for (;;) {
+    const path = join(framesDir(name), `.${candidate}.reserve`);
+    if (await Bun.file(join(framesDir(name), `${candidate}.txt`)).exists()) {
+      candidate = `${base}-${counter}`;
+      counter += 1;
+      continue;
+    }
+    try {
+      const handle = await open(path, "wx", 0o600);
+      await handle.close();
+      return { id: candidate, path };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      candidate = `${base}-${counter}`;
+      counter += 1;
+    }
   }
-  return candidate;
 }
 
 /**
@@ -118,53 +136,62 @@ export async function saveFrame(
 ): Promise<FrameRecord> {
   const directory = framesDir(name);
   await ensureDir(directory);
-
   const stamp = stampFor(new Date(snapshot.capturedAtMs));
   const base = options.label ? `${stamp}-${options.label}` : stamp;
-  const id = await uniqueFrameId(name, base);
+  const reservation = await reserveFrameId(name, base);
+  const id = reservation.id;
 
-  const textPath = join(directory, `${id}.txt`);
-  const ansiPath = join(directory, `${id}.ansi`);
-  await Bun.write(textPath, `${snapshot.text}\n`);
-  await Bun.write(ansiPath, snapshot.ansi);
+  try {
+    const textPath = join(directory, `${id}.txt`);
+    const ansiPath = join(directory, `${id}.ansi`);
+    const statePath = join(directory, `${id}.json`);
+    await writePrivateFile(textPath, `${snapshot.text}\n`);
+    await writePrivateFile(ansiPath, snapshot.ansi);
+    await writePrivateFile(statePath, `${JSON.stringify(snapshot, null, 2)}\n`);
 
-  let imagePath: string | undefined;
-  if (options.image) {
-    const extension = options.image === "svg" ? "svg" : "png";
-    imagePath = join(directory, `${id}.${extension}`);
-    await renderAnsiToFile(snapshot.ansi, imagePath, {
+    let imagePath: string | undefined;
+    if (options.image) {
+      const extension = options.image === "svg" ? "svg" : "png";
+      imagePath = join(directory, `${id}.${extension}`);
+      await renderAnsiToFile(snapshot.ansi, imagePath, {
+        cols: snapshot.cols,
+        rows: snapshot.rows,
+        cursor: snapshot.cursor,
+        format: options.image,
+        ...(options.theme ? { theme: options.theme } : {}),
+        ...(options.fontSize ? { fontSize: options.fontSize } : {}),
+        ...(options.scale ? { scale: options.scale } : {}),
+        title: `${name} @ ${snapshot.capturedAt}`,
+      });
+    }
+
+    const record: FrameRecord = {
+      schemaVersion: 1,
+      id,
+      kind: options.kind,
+      ...(options.label ? { label: options.label } : {}),
+      capturedAt: snapshot.capturedAt,
+      elapsedMs: snapshot.elapsedMs,
+      hash: snapshot.hash,
+      stateHash: snapshot.stateHash,
       cols: snapshot.cols,
       rows: snapshot.rows,
       cursor: snapshot.cursor,
-      format: options.image,
-      ...(options.theme ? { theme: options.theme } : {}),
-      ...(options.fontSize ? { fontSize: options.fontSize } : {}),
-      ...(options.scale ? { scale: options.scale } : {}),
-      title: `${name} @ ${snapshot.capturedAt}`,
-    });
+      dead: snapshot.dead,
+      command: snapshot.command,
+      files: {
+        text: textPath,
+        ansi: ansiPath,
+        state: statePath,
+        ...(imagePath ? { image: imagePath } : {}),
+      },
+    };
+
+    await appendJsonl(framesIndexPath(name), record);
+    return record;
+  } finally {
+    await rm(reservation.path, { force: true });
   }
-
-  const record: FrameRecord = {
-    id,
-    kind: options.kind,
-    ...(options.label ? { label: options.label } : {}),
-    capturedAt: snapshot.capturedAt,
-    elapsedMs: snapshot.elapsedMs,
-    hash: snapshot.hash,
-    cols: snapshot.cols,
-    rows: snapshot.rows,
-    cursor: snapshot.cursor,
-    dead: snapshot.dead,
-    command: snapshot.command,
-    files: {
-      text: textPath,
-      ansi: ansiPath,
-      ...(imagePath ? { image: imagePath } : {}),
-    },
-  };
-
-  await appendJsonl(framesIndexPath(name), record);
-  return record;
 }
 
 /**
@@ -249,4 +276,16 @@ export async function readFrameAnsi(frame: FrameRecord): Promise<string> {
   const file = Bun.file(frame.files.ansi);
   if (!(await file.exists())) return "";
   return file.text();
+}
+
+/** Read the complete versioned snapshot stored with a frame, when recorded by a recent version. */
+export async function readFrameState(frame: FrameRecord): Promise<Snapshot | undefined> {
+  if (!frame.files.state) return undefined;
+  const file = Bun.file(frame.files.state);
+  if (!(await file.exists())) return undefined;
+  try {
+    return (await file.json()) as Snapshot;
+  } catch {
+    return undefined;
+  }
 }

@@ -5,7 +5,8 @@
 
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
+import { appendFile, chmod, mkdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 
 import { UsageError } from "./errors.js";
 
@@ -121,7 +122,10 @@ export function formatElapsed(ms: number): string {
 
 /** Create a directory and every missing parent. Succeeds if it already exists. */
 export async function ensureDir(path: string): Promise<void> {
-  await mkdir(path, { recursive: true });
+  await mkdir(path, { recursive: true, mode: 0o700 });
+  /* mkdir's mode is filtered by umask and does not change an existing directory. State may contain
+     commands, screen contents and environment metadata, so repair both cases deliberately. */
+  await chmod(path, 0o700);
 }
 
 /**
@@ -152,8 +156,11 @@ export async function readJsonl<T>(path: string): Promise<T[]> {
 
 /** Append one entry to a JSON-lines file, creating it if needed. */
 export async function appendJsonl(path: string, entry: unknown): Promise<void> {
-  const { appendFile } = await import("node:fs/promises");
-  await appendFile(path, `${JSON.stringify(entry)}\n`, "utf8");
+  await ensureDir(dirname(path));
+  await withFileLock(`${path}.lock`, async () => {
+    await appendFile(path, `${JSON.stringify(entry)}\n`, { encoding: "utf8", mode: 0o600 });
+    await chmod(path, 0o600);
+  });
 }
 
 /**
@@ -176,7 +183,65 @@ export async function readJson<T>(path: string): Promise<T | undefined> {
 
 /** Write a value as pretty-printed JSON with a trailing newline. */
 export async function writeJson(path: string, value: unknown): Promise<void> {
-  await Bun.write(path, `${JSON.stringify(value, null, 2)}\n`);
+  await writePrivateFile(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+/** Atomically replace a private state file, never exposing a partial write to another process. */
+export async function writePrivateFile(path: string, contents: string | Uint8Array): Promise<void> {
+  await ensureDir(dirname(path));
+  const temp = join(
+    dirname(path),
+    `.${basename(path)}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`,
+  );
+  try {
+    await writeFile(temp, contents, { mode: 0o600 });
+    await chmod(temp, 0o600);
+    await rename(temp, path);
+    await chmod(path, 0o600);
+  } finally {
+    await rm(temp, { force: true }).catch(() => undefined);
+  }
+}
+
+/**
+ * Serialise a short cross-process mutation with an atomic lock directory.
+ *
+ * Locks older than 30 seconds are abandoned writer remnants and are reclaimed. Callers should keep
+ * the critical section small: this protects metadata and indexes, not long-running work.
+ */
+export async function withFileLock<T>(
+  lockPath: string,
+  action: () => Promise<T>,
+  timeoutMs = 5000,
+): Promise<T> {
+  const started = Date.now();
+  await ensureDir(dirname(lockPath));
+  for (;;) {
+    try {
+      await mkdir(lockPath, { mode: 0o700 });
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      try {
+        const info = await stat(lockPath);
+        if (Date.now() - info.mtimeMs > 30_000) {
+          await rm(lockPath, { recursive: true, force: true });
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      if (Date.now() - started >= timeoutMs) {
+        throw new UsageError(`timed out waiting for state lock: ${lockPath}`);
+      }
+      await sleep(20);
+    }
+  }
+  try {
+    return await action();
+  } finally {
+    await rm(lockPath, { recursive: true, force: true });
+  }
 }
 
 /**

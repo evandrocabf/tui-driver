@@ -7,7 +7,7 @@
  * between and quietly desynchronise the two halves.
  */
 
-import { stripAnsi } from "./ansi.js";
+import { parseAnsiScreen, stripAnsi, type ParsedScreen } from "./ansi.js";
 import { SessionError } from "./errors.js";
 import { readMeta } from "./meta.js";
 import type { MouseModes } from "./mouse.js";
@@ -31,6 +31,8 @@ export interface CursorState {
  * renderer draws from its `ansi`, and every assertion reads its `text`.
  */
 export interface Snapshot {
+  /** Version of the machine-readable snapshot contract. */
+  schemaVersion: 1;
   /** The session this was captured from. */
   session: string;
   /** Capture time as an ISO-8601 string. */
@@ -65,6 +67,10 @@ export interface Snapshot {
   text: string;
   /** Content hash of {@link Snapshot.ansi}, used to tell whether the screen actually changed. */
   hash: string;
+  /** Hash of the complete observable pane state, including cursor, modes, size and process exit. */
+  stateHash: string;
+  /** Styled cell grid reconstructed from tmux's final rendered capture. */
+  grid: ParsedScreen;
 }
 
 /** How much of the pane to capture. */
@@ -170,34 +176,50 @@ export async function capture(name: string, options: CaptureOptions = {}): Promi
 
   const deadStatus = fields[7] ?? "";
 
+  const cols = toInt(fields[1], 80);
+  const rows = toInt(fields[2], 24);
+  const cursor = {
+    x: toInt(fields[3], 0),
+    y: toInt(fields[4], 0),
+    visible: flag(fields[5]),
+  };
+  const dead = flag(fields[6]);
+  const exitStatus = deadStatus === "" ? undefined : toInt(deadStatus, 0);
+  const alternateScreen = flag(fields[10]);
+  const mouse = {
+    any: flag(fields[12]),
+    standard: flag(fields[13]),
+    button: flag(fields[14]),
+    all: flag(fields[15]),
+    sgr: flag(fields[16]),
+    utf8: flag(fields[17]),
+  };
+  const hash = hashText(ansi);
+  const grid = parseAnsiScreen(ansi, cols);
+  const stateHash = hashText(
+    JSON.stringify({ hash, cols, rows, cursor, dead, exitStatus, alternateScreen, mouse }),
+  );
+
   return {
+    schemaVersion: 1,
     session: name,
     capturedAt: new Date(capturedAtMs).toISOString(),
     capturedAtMs,
     elapsedMs: Math.max(0, capturedAtMs - startedAtMs),
-    cols: toInt(fields[1], 80),
-    rows: toInt(fields[2], 24),
-    cursor: {
-      x: toInt(fields[3], 0),
-      y: toInt(fields[4], 0),
-      visible: flag(fields[5]),
-    },
-    dead: flag(fields[6]),
-    exitStatus: deadStatus === "" ? undefined : toInt(deadStatus, 0),
+    cols,
+    rows,
+    cursor,
+    dead,
+    exitStatus,
     command: fields[8] ?? "",
     panePid: toInt(fields[9], 0),
-    alternateScreen: flag(fields[10]),
+    alternateScreen,
     historySize: toInt(fields[11], 0),
-    mouse: {
-      any: flag(fields[12]),
-      standard: flag(fields[13]),
-      button: flag(fields[14]),
-      all: flag(fields[15]),
-      sgr: flag(fields[16]),
-      utf8: flag(fields[17]),
-    },
+    mouse,
     ansi,
     text,
-    hash: hashText(ansi),
+    hash,
+    stateHash,
+    grid,
   };
 }

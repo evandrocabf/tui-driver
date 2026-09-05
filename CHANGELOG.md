@@ -11,6 +11,19 @@ repository with `install.sh`.
 
 ### Added
 
+- **Complete pane-state contracts.** Snapshots and frames now carry `schemaVersion`, `stateHash` and
+  a styled cell grid. Waits, recorders, diffs and scenario goldens can observe cursor, dimensions,
+  modes and process state in addition to plain text.
+- **Exact modern input.** `tui bytes`, `tui focus`, `tui key-event` and `tui capabilities` expose raw
+  input, focus transitions, Kitty CSI-u press/repeat/release events and runtime capability discovery.
+- **Strict, diagnosable scenarios.** Versioned schemas reject unknown structure before launch;
+  expectations cover counts, cursor, cells and regions; masks normalise volatile values; text, ANSI
+  and state goldens require explicit update; every failed step writes text, ANSI, JSON and SVG.
+- **Safe concurrent state.** Private permissions, redacted environment values, atomic JSON writes,
+  recorder ownership tokens, frame reservations and index locks prevent disclosure and races.
+- **End-to-end diagnostics.** `tui doctor` enforces tmux 3.2 and proves create, capture, input, resize
+  and cleanup against the private socket.
+
 - **Driving a TUI from the shell.** `tui start` runs any terminal program inside a private tmux
   server, and `snap`, `keys`, `type`, `paste`, `click`, `move`, `drag`, `scroll`, `wait`, `find`,
   `resize` and `stop` act on it. Every command has a `--json` form, so a program — or an agent — can
@@ -22,7 +35,7 @@ repository with `install.sh`.
 - **Real mouse support.** Clicks are encoded in the wire protocol the application itself turned on —
   `sgr(1006)`, `utf8(1005)` or `x10`, detected per event through tmux's mode flags — and injected as
   raw bytes.
-- **Recording over time.** `tui watch` records every screen change in the background, `tui frames`
+- **Recording over time.** `tui watch` samples pane state and records each observed change in the background, `tui frames`
   lists what it captured, and `tui diff` compares any two frames, including against `live`.
 - **Repeatable checks.** `tui run <scenario.yaml>` drives a session through a scripted list of steps
   with `expect` and `golden` assertions. `examples/menu-smoke.yaml` is a working example, exercised

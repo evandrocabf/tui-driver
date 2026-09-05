@@ -2,8 +2,9 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 
 import { listFrames } from "../../src/frames.js";
 import { sendKeys } from "../../src/input.js";
+import { watcherPath } from "../../src/paths.js";
 import { startSession, stopSession } from "../../src/session.js";
-import { isProcessAlive } from "../../src/util.js";
+import { isProcessAlive, writeJson } from "../../src/util.js";
 import { readWatcher, runWatchLoop, startWatcher, stopWatcher } from "../../src/watch.js";
 import { waitFor } from "../../src/wait.js";
 import {
@@ -41,7 +42,7 @@ describe.skipIf(!TOOLS_AVAILABLE)("recorder", () => {
     restoreHome(previousHome);
   });
 
-  test("records a frame per change in a detached process, and stops on request", async () => {
+  test("records each observed state change in a detached process, and stops on request", async () => {
     await startFixture("watch-bg");
     const state = await startWatcher("watch-bg", { intervalMs: 120, stopOnExit: true });
     expect(state.pid).toBeGreaterThan(0);
@@ -72,6 +73,18 @@ describe.skipIf(!TOOLS_AVAILABLE)("recorder", () => {
     await stopSession("watch-dup", { purge: true });
   }, 60_000);
 
+  test("serialises concurrent recorder starts", async () => {
+    await startFixture("watch-race");
+    const results = await Promise.allSettled([
+      startWatcher("watch-race", { intervalMs: 200, stopOnExit: true }),
+      startWatcher("watch-race", { intervalMs: 200, stopOnExit: true }),
+    ]);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+    await stopWatcher("watch-race");
+    await stopSession("watch-race", { purge: true });
+  }, 60_000);
+
   test("stopWatcher reports false when nothing is recording", async () => {
     expect(await stopWatcher("watch-never")).toBe(false);
     expect(await readWatcher("watch-never")).toBeUndefined();
@@ -80,14 +93,21 @@ describe.skipIf(!TOOLS_AVAILABLE)("recorder", () => {
   test("only writes a frame when the screen actually changed", async () => {
     await startFixture("watch-hash");
 
+    await writeJson(watcherPath("watch-hash"), { token: "foreground-owner" });
+
     /* The screen is static, so a long run still produces exactly one frame. */
-    const saved = await runWatchLoop("watch-hash", {
-      intervalMs: 50,
-      stopOnExit: true,
-      durationMs: 400,
-    });
+    const saved = await runWatchLoop(
+      "watch-hash",
+      {
+        intervalMs: 50,
+        stopOnExit: true,
+        durationMs: 400,
+      },
+      "foreground-owner",
+    );
     expect(saved).toBe(1);
     expect(await listFrames("watch-hash")).toHaveLength(1);
+    expect(await Bun.file(watcherPath("watch-hash")).exists()).toBe(false);
 
     await stopSession("watch-hash", { purge: true });
   }, 60_000);
@@ -131,5 +151,21 @@ describe.skipIf(!TOOLS_AVAILABLE)("recorder", () => {
 
   test("returns without recording when the session is already gone", async () => {
     expect(await runWatchLoop("watch-absent", { intervalMs: 50, stopOnExit: true })).toBe(0);
+  }, 30_000);
+
+  test("stops a foreground recording loop when the process receives an interrupt", async () => {
+    await startFixture("watch-signal");
+    const interrupt = setTimeout(() => process.emit("SIGINT"), 60);
+    try {
+      const saved = await runWatchLoop("watch-signal", {
+        intervalMs: 40,
+        stopOnExit: true,
+        durationMs: 30_000,
+      });
+      expect(saved).toBe(1);
+    } finally {
+      clearTimeout(interrupt);
+      await stopSession("watch-signal", { purge: true });
+    }
   }, 30_000);
 });

@@ -1,7 +1,7 @@
 # tui-driver
 
-Drive, see and snapshot **any** terminal UI through tmux — built so a coding agent can open a TUI,
-look at what is on the screen, click on it, navigate it, and keep watching it over time.
+Drive, inspect and test **cell-grid terminal UIs** through tmux — built so a coding agent can open a
+TUI, inspect its styled cells and complete pane state, send exact input, and watch it over time.
 
 The agent never needs a terminal of its own. Every operation is a one-shot CLI command that prints
 the current screen as plain text, so it composes with the plain shell access every agent already has.
@@ -9,10 +9,11 @@ the current screen as plain text, so it composes with the plain shell access eve
 ```
 tui start --name app -- htop        # launch a TUI, detached, at a fixed size
 tui snap app                        # print what is on screen right now
+tui capabilities app                # discover the active pane's exact capabilities
 tui keys app Down Down Enter        # press keys
 tui click app --text "Settings"     # click the cell where that text is drawn
 tui wait app --text "Saved"         # block until the screen says something
-tui watch app --interval 500ms      # keep recording every change in the background
+tui watch app --interval 500ms      # sample state and record each observed change
 tui render app --out shot.png       # rasterise a frame so the agent can *look* at it
 ```
 
@@ -33,6 +34,11 @@ video on the selected row, and the mouse event the app received are all real.
   warning rather than a failure.
 
 Run `tui doctor` to check all of this at once.
+
+The managed scope is one tmux pane containing a character-cell TUI. Sixel, Kitty graphics and iTerm
+images are not represented by tmux's cell capture, and a private PTY cannot prove behavior that
+depends on a physical terminal emulator. `tui capabilities <session>` reports this boundary along
+with the live keyboard, mouse and capture modes.
 
 ## Install
 
@@ -177,6 +183,12 @@ hanging on a bare `htop`, it is wired up.
 5. **`tui wait --text ... --stable ...`** — synchronise instead of sleeping and hoping.
 6. **`tui stop`** — done. And if you never get there, the session stops itself (see below).
 
+`snap --json` is versioned and contains both `hash` (ANSI content only) and `stateHash` (content,
+cursor, dimensions, buffer, mouse modes and process state), plus the styled `grid`. `wait --stable`
+uses complete state. `wait --changed-from`, `--cursor`, `--cursor-visible` and `--alternate` can
+synchronise on state transitions directly. When `start --wait-text` misses its deadline, the session
+is left available for inspection and the command exits 1.
+
 A complete turn in one command:
 
 ```bash
@@ -189,26 +201,30 @@ tui click app --text "Save" --snap        # click, settle, print the new screen
 | ------------------ | ----------------------------------------------------------------------------- |
 | `start`            | Launch a command in a detached, fixed-size tmux session                       |
 | `ls`               | List running sessions, their size, state and recorder                         |
+| `capabilities`     | Report the live input, mouse and capture capabilities                         |
 | `snap`             | Capture the screen: text, ANSI, JSON, and optionally an image                 |
 | `keys`             | Send key presses (`Down`, `C-c`, `Escape`, `F5`, `ctrl+c`, `^c`, …)           |
 | `type`             | Type literal text                                                             |
 | `paste`            | Paste a block, with bracketed paste by default                                |
+| `bytes`            | Inject exact bytes from hexadecimal, base64 or a file                         |
+| `focus`            | Send terminal focus-in or focus-out                                           |
+| `key-event`        | Send Kitty CSI-u press, repeat and release events                             |
 | `click`            | Mouse click at a cell, or at matching on-screen text                          |
 | `move`             | Move the pointer (motion event)                                               |
 | `drag`             | Press, move through intermediate cells, release                               |
 | `scroll`           | Mouse wheel, in any of the four directions                                    |
 | `find`             | Locate text and report clickable coordinates                                  |
 | `wait`             | Block until text appears/disappears, the screen settles, or the process exits |
-| `watch`            | Record every screen change in the background                                  |
+| `watch`            | Sample complete pane state and record each observed change                    |
 | `frames` / `frame` | List and print recorded frames                                                |
 | `render`           | Rasterise a frame (or the live screen) to PNG/SVG                             |
-| `diff`             | Compare two frames, or a frame against the live screen                        |
+| `diff`             | Compare text, ANSI or complete cell state                                     |
 | `resize`           | Change the terminal size                                                      |
 | `stop` / `clean`   | Kill a session / delete its artifacts                                         |
 | `keepalive`        | Push back a session's auto-stop deadline                                      |
 | `gc`               | Kill sessions whose lease ran out (also runs before every command)            |
 | `run`              | Execute a YAML or JSON scenario                                               |
-| `doctor`           | Check tmux, terminfo and image rendering                                      |
+| `doctor`           | Run version, terminfo and end-to-end tmux canary checks                       |
 
 `tui help <command>` prints the options for any of them.
 
@@ -250,7 +266,7 @@ tmux reports which mode the application enabled, so the encoding is auto-detecte
 - `sgr(1006)` — the modern encoding, no coordinate limit. Preferred when available.
 - `utf8(1005)` — legacy UTF-8 encoding.
 - `x10` — the original byte encoding. Coordinates above column/row 94 are unreliable and the CLI
-  warns when you cross that line.
+  rejects them unless `--force` is explicit.
 
 Tracking level is reported too — `normal(1000)`, `button-event(1002)`, `any-event(1003)` — and every
 snapshot header shows it:
@@ -259,8 +275,11 @@ snapshot header shows it:
 ── app · 64x14 · cursor 10,11 (hidden) · python3 · mouse button-event(1002)/sgr(1006) · +2.2s
 ```
 
-If the TUI never enabled mouse reporting, `mouse off` appears in the header and mouse commands warn
-that the event will be ignored rather than silently doing nothing.
+If the TUI never enabled mouse reporting, `mouse off` appears in the header and mouse commands exit
+1 before injecting anything. `--force` delivers the bytes when that is explicitly intended.
+Coordinates outside the screen, unknown encodings and non-positive counts are rejected. Text-targeted
+actions recheck `stateHash` before sending; `--if-hash <hash>` provides the same stale-screen guard
+for coordinate actions.
 
 **Coordinates are 0-based**, matching the JSON snapshot and `--ruler` output. Column 0 row 0 is the
 top-left cell. The wire protocol's 1-based values are handled internally.
@@ -277,6 +296,21 @@ tui move  app 20 6                       # hover
 tui drag  app 1 1 40 10 --steps 8        # drag with intermediate motion events
 tui scroll app --down --amount 5         # wheel
 ```
+
+## Exact keyboard and terminal input
+
+`keys`, `type` and `paste` cover ordinary interaction. Protocol tests and applications using modern
+keyboard negotiation can also receive exact input:
+
+```bash
+tui bytes app --hex "1b 5b 49"                    # arbitrary bytes
+tui bytes app --file recorded-input.bin
+tui focus app --in                                 # CSI I; --out sends CSI O
+tui key-event app A --event repeat --modifiers ctrl
+```
+
+The private tmux server enables focus events and extended keys in CSI-u form. `key-event` emits the
+Kitty CSI-u event type explicitly; `bytes` remains the escape hatch for any negotiated protocol.
 
 ## Images
 
@@ -303,7 +337,7 @@ a session's artifacts, and `--out` still aims anywhere you like.
 ## Recording over time
 
 ```bash
-tui watch app --interval 500ms                 # background recorder, a frame per change
+tui watch app --interval 500ms                 # background state sampler
 tui watch app --interval 1s --keep 200 --png   # rolling window, with images
 tui watch app --status
 tui watch app --stop
@@ -311,14 +345,18 @@ tui frames app --last 10
 tui diff app -1 live
 ```
 
-The recorder only writes when the screen actually changed (frames are content-hashed), so an idle
-TUI costs nothing on disk. `tui start --record 500ms` starts one along with the session.
+The recorder hashes ANSI content, cursor, size, screen buffer, mouse modes and process state. It
+writes only when an observed state changed, so an idle TUI costs nothing on disk. It samples at the
+requested interval and therefore does not claim to capture states that appear and disappear between
+polls. `tui start --record 500ms` starts one along with the session. Recorder ownership and frame
+indexes are protected against concurrent commands.
 
 ## Scenarios
 
 A scenario is a repeatable script — the "tester" half of the tool.
 
 ```yaml
+schemaVersion: 1
 name: menu-smoke
 command: ["python3", "tests/fixtures/menu.py"]
 size: 64x14
@@ -335,7 +373,7 @@ steps:
   - click: { text: "Reports" }
   - wait: { stable: 250ms }
   - expect: { text: "ACTIVATED: Reports" }
-  - snap: { label: 02-reports, png: true }
+  - snap: { label: 02-reports, svg: true }
 
   - golden: menu-reports
 
@@ -348,14 +386,18 @@ tui run examples/menu-smoke.yaml                   # exit 1 if any step fails
 tui run examples/menu-smoke.yaml --update-golden   # rewrite the golden screens
 ```
 
-Top-level keys besides `steps`: `name`, `command` / `shell`, `cwd`, `size`, `env`, `session`,
-`settle`, `record`, `goldenDir`, and `ttl` for a scenario that legitimately runs longer than the
-default 10-minute lease. The session is stopped when the run ends — including when it ends badly —
-unless `--keep` is passed, and even then it expires like any other.
+Top-level keys besides `steps`: `schemaVersion`, `name`, `command` / `shell`, `cwd`, `size`, `env`,
+`session`, `settle`, `record`, `goldenDir`, `masks`, and `ttl`. Unknown fields, invalid types and
+steps containing more than one action are rejected before launch. Paths inside steps resolve from
+the scenario directory. The session is stopped when the run ends unless `--keep` is passed, and
+even then it expires like any other.
 
-Steps: `wait`, `sleep`, `snap`, `keys`, `type`, `paste`, `click`, `move`, `drag`, `scroll`,
-`resize`, `expect`, `golden`. A failing step stops the run, prints the offending screen, and writes
-`report.json` plus the actual screen next to the golden.
+Steps: `wait`, `sleep`, `snap`, `keys`, `bytes`, `focus`, `keyEvent`, `type`, `paste`, `click`,
+`move`, `drag`, `scroll`, `resize`, `expect`, `golden`. `expect` supports match counts, cursor state,
+styled cells and rectangular regions. Goldens support `text`, `ansi` and `state`; a missing golden
+fails until `--update-golden` creates it. `masks` normalise volatile literals or regular expressions.
+A failing step stops the run and writes `report.json` plus `.txt`, `.ansi`, `.json` and `.svg`
+failure artifacts.
 
 ## Where things live
 
@@ -364,15 +406,17 @@ $XDG_STATE_HOME/tui-driver/          # override with TUI_DRIVER_HOME
 ├── tmux.sock                        # a private tmux server, isolated from yours
 ├── tmux.conf                        # status bar off, no key bindings, panes kept after exit
 └── sessions/<name>/
-    ├── session.json                 # command, cwd, size, start time, lease
+    ├── session.json                 # command, cwd, size, start time, lease; env values redacted
     ├── frames.jsonl                 # one line per frame
     ├── frames/<stamp>[-label].txt   # plain text
     ├── frames/<stamp>[-label].ansi  # ANSI, the source for rendering
+    ├── frames/<stamp>[-label].json  # complete versioned state and styled grid
     └── watcher.json                 # recorder pid, if running
 ```
 
 The tmux server is entirely separate from any tmux you are running: its own socket, its own config,
-no key bindings, no status bar. It cannot interfere with your sessions.
+no key bindings, no status bar. State directories use mode `0700`, files use `0600`, JSON replacement
+is atomic, and environment values are never persisted. It cannot interfere with your sessions.
 
 You can still attach and watch a session live — `tui start` prints the exact command:
 
@@ -429,7 +473,7 @@ What is different here: mouse events are encoded in the protocol the application
 exact wire bytes verified end to end; the tmux server is private, with its own socket and config, so
 it cannot collide with the sessions or key bindings you already have; there is a self-contained
 ANSI → SVG → PNG renderer, so an agent can _look_ at the TUI rather than only read it; and
-synchronisation is explicit (`wait --stable`, `wait --exit`, content-hashed frames) instead of
+synchronisation is explicit (`wait --stable`, `wait --exit`, complete-state hashes) instead of
 sleeping and hoping. Being a one-shot CLI rather than a library is the point: it composes with any
 agent, shell or CI step without a long-lived process to hold.
 

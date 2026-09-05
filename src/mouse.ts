@@ -29,7 +29,7 @@ export type MouseEncoding = "sgr" | "utf8" | "x10";
  * The mouse reporting modes an application has enabled, as tmux reports them.
  *
  * When {@link MouseModes.any} is false the application is not listening at all, and injected mouse
- * bytes would be swallowed — which is why the commands warn instead of silently doing nothing.
+ * bytes may be interpreted as unrelated input — which is why commands reject them unless forced.
  */
 export interface MouseModes {
   /** Any mouse reporting at all is on. */
@@ -214,8 +214,7 @@ function clampLegacy(value: number): number {
  * Whether an event falls outside what the x10 encoding can express.
  *
  * x10 packs each coordinate into a single byte with a 32 offset, so anything past column or row 94
- * silently lands somewhere else. The CLI warns rather than failing, because the click may still be
- * what the caller wanted on a narrow screen.
+ * silently lands somewhere else. The CLI rejects it unless raw delivery was explicitly forced.
  */
 export function legacyOutOfRange(spec: MouseEventSpec, encoding: MouseEncoding): boolean {
   if (encoding !== "x10") return false;

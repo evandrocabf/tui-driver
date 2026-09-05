@@ -1,9 +1,9 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { isProcessAlive, readJson, readJsonl } from "../../src/util.js";
+import { isProcessAlive, readJson, readJsonl, withFileLock } from "../../src/util.js";
 import { encodeMouseEvent, NO_MODIFIERS, type MouseEventSpec } from "../../src/mouse.js";
 import { buildSvg } from "../../src/render.js";
 
@@ -53,6 +53,16 @@ describe("readJson tolerates a damaged file", () => {
 
   test("a missing file reads as undefined", async () => {
     expect(await readJson(join(workDir, "absent.json"))).toBeUndefined();
+  });
+});
+
+describe("withFileLock", () => {
+  test("recovers a lock directory left stale by a dead writer", async () => {
+    const path = join(workDir, "stale.lock");
+    await mkdir(path);
+    await utimes(path, new Date(0), new Date(0));
+
+    expect(await withFileLock(path, () => Promise.resolve("acquired"))).toBe("acquired");
   });
 });
 
