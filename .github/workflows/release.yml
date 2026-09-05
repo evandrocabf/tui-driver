@@ -3,31 +3,46 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing annotated release tag to publish
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   validate:
     name: validate release tag
     runs-on: ubuntu-24.04
+    outputs:
+      commit: ${{ steps.tag.outputs.commit }}
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
 
       - name: Require an annotated version tag on main
+        id: tag
         run: |
           version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' package.json | head -n 1)"
-          test "$GITHUB_REF_NAME" = "v$version"
-          test "$(git cat-file -t "$GITHUB_REF_NAME")" = "tag"
-          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
-          commit="$(git rev-parse "$GITHUB_REF_NAME^{commit}")"
+          test "$RELEASE_TAG" = "v$version"
+          git fetch --no-tags origin "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG" +refs/heads/main:refs/remotes/origin/main
+          test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = "tag"
+          commit="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          test "$(git rev-parse HEAD)" = "$commit"
           git merge-base --is-ancestor "$commit" origin/main
+          printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
 
   build:
     name: build (${{ matrix.asset }})
@@ -52,6 +67,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -70,7 +87,9 @@ jobs:
       - run: bun install --frozen-lockfile
 
       - name: Build native standalone package
-        run: bun run build:release --target "${{ matrix.target }}"
+        run: |
+          GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$RELEASE_TAG" GITHUB_SHA="$(git rev-parse HEAD)" \
+            bun run build:release --target "${{ matrix.target }}"
 
       - name: Smoke-test standalone package
         run: |
@@ -89,13 +108,15 @@ jobs:
 
   publish:
     name: publish GitHub release
-    needs: build
+    needs: [validate, build]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -112,13 +133,53 @@ jobs:
         run: |
           cp install.sh dist/install.sh
           prerelease=()
-          case "$GITHUB_REF_NAME" in
+          case "$RELEASE_TAG" in
             *-*) prerelease+=(--prerelease) ;;
           esac
-          gh release create "$GITHUB_REF_NAME" dist/* \
+          gh release create "$RELEASE_TAG" dist/* \
             --verify-tag \
-            --title "tui-driver $GITHUB_REF_NAME" \
+            --title "tui-driver $RELEASE_TAG" \
             --generate-notes \
             --draft \
             "${prerelease[@]}"
-          gh release edit "$GITHUB_REF_NAME" --draft=false
+          gh release edit "$RELEASE_TAG" --draft=false
+
+  verify-install:
+    name: verify published install (${{ matrix.runner }})
+    needs: publish
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-15]
+    steps:
+      - name: Install tmux (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux ncurses-term
+
+      - name: Install tmux (macOS)
+        if: runner.os == 'macOS'
+        run: brew install tmux
+
+      - name: Verify pinned and latest public installers
+        env:
+          RELEASE_BASE: https://github.com/${{ github.repository }}/releases
+        run: |
+          root="$(mktemp -d)"
+          trap 'rm -rf "$root"' EXIT
+          versions=("$RELEASE_TAG")
+          case "$RELEASE_TAG" in
+            *-*) ;;
+            *) versions+=(latest) ;;
+          esac
+          for version in "${versions[@]}"; do
+            url="$RELEASE_BASE/download/$version/install.sh"
+            if [ "$version" = latest ]; then url="$RELEASE_BASE/latest/download/install.sh"; fi
+            curl -fsSL --retry 3 "$url" -o "$root/install.sh"
+            bash "$root/install.sh" --version "$version" --no-agents \
+              --prefix "$root/$version/bin" --install-dir "$root/$version/data"
+            test "$(env PATH=/usr/bin:/bin "$root/$version/bin/tui" --version)" = "tui-driver ${RELEASE_TAG#v}"
+            TUI_DRIVER_HOME="$root/$version/state" "$root/$version/bin/tui" doctor
+          done
